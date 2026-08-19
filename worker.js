@@ -1,22 +1,13 @@
 /* ============================================================
    DOXACHKAA UC — worker.js
-   ЧАСТЬ 1/4
-   Cloudflare Worker + Telegram + D1
-   ПОД ТЕКУЩУЮ СХЕМУ БАЗЫ
+   ЧАСТЬ 1/5
+   Cloudflare Worker + Telegram Bot API + D1
+   Версия под фактическую схему D1
    ============================================================ */
-
-const CONFIG = {
-  moscowTimezone: "Europe/Moscow",
-  minWithdrawUC: 3000,
-  pointsPerAction: 15,
-  requiredActivityMinutes: 240,
-  dailyActivityBonus: 100,
-  maxMessageLength: 4000
-};
 
 const RANKS = {
   0: {
-    name: "Игрок",
+    name: "Обычный игрок",
     color: "#FFFFFF",
     admin: false
   },
@@ -57,11 +48,19 @@ const MODERATOR = {
   color: "#FFFF00"
 };
 
-const ADMIN_RANK_MIN = 1;
-const SUPER_ADMIN_RANK = 5;
+const CONFIG = {
+  botName: "DOXACHKAA UC",
+  moscowTimezone: "Europe/Moscow",
+  pointsPerAction: 15,
+  dailyActivityBonus: 100,
+  requiredActivityMinutes: 240,
+  minWithdrawUC: 3000
+};
+
+const SECRET_RANK_MIN = 5;
 
 /* ============================================================
-   WORKER
+   WORKER ENTRY
    ============================================================ */
 
 export default {
@@ -89,7 +88,6 @@ export default {
       return new Response("OK", {
         status: 200
       });
-
     } catch (error) {
       console.error(
         "WORKER ERROR:",
@@ -153,7 +151,7 @@ async function sendMessage(
     "sendMessage",
     {
       chat_id: chatId,
-      text: String(text),
+      text,
       parse_mode: "HTML",
       ...extra
     },
@@ -173,7 +171,7 @@ async function editMessage(
     {
       chat_id: chatId,
       message_id: messageId,
-      text: String(text),
+      text,
       parse_mode: "HTML",
       ...extra
     },
@@ -190,14 +188,14 @@ async function answerCallback(
     "answerCallbackQuery",
     {
       callback_query_id: callbackId,
-      text: String(text)
+      text
     },
     env
   );
 }
 
 /* ============================================================
-   DATABASE
+   DATABASE HELPERS
    ============================================================ */
 
 async function dbGet(
@@ -237,7 +235,7 @@ async function dbRun(
 }
 
 /* ============================================================
-   UPDATE
+   UPDATE ROUTER
    ============================================================ */
 
 async function handleUpdate(
@@ -276,15 +274,18 @@ async function handleMessage(
   const telegramId =
     String(message.from.id);
 
+  const chatId =
+    message.chat.id;
+
+  const text =
+    String(message.text || "")
+      .trim();
+
   await ensureUser(
     env,
     telegramId,
     message.from
   );
-
-  const text =
-    String(message.text || "")
-      .trim();
 
   if (!text) {
     return;
@@ -299,31 +300,6 @@ async function handleMessage(
     return;
   }
 
-  /*
-   * Сначала проверяем ввод пароля
-   * и другие состояния панели.
-   */
-  if (
-    await processAuthInput(
-      message,
-      env
-    )
-  ) {
-    return;
-  }
-
-  if (
-    await handleTextState(
-      message,
-      env
-    )
-  ) {
-    return;
-  }
-
-  /*
-   * Обычное сообщение.
-   */
   await handleGlobalChat(
     message,
     env
@@ -358,9 +334,9 @@ async function ensureUser(
            last_name = ?,
            updated_at = datetime('now')
        WHERE telegram_id = ?`,
-      tgUser.username || "",
-      tgUser.first_name || "",
-      tgUser.last_name || "",
+      tgUser.username || null,
+      tgUser.first_name || null,
+      tgUser.last_name || null,
       telegramId
     );
 
@@ -391,22 +367,17 @@ async function ensureUser(
        panel_session,
        panel_status
      )
-     VALUES
-     (
-       ?, ?, ?, ?,
-       'player',
-       0,
-       0,
-       0,
+     VALUES (
+       ?, ?, ?, ?, 'player', 0, 0, 0,
        datetime('now'),
        datetime('now'),
        0,
        'offline'
      )`,
     telegramId,
-    tgUser.username || "",
-    tgUser.first_name || "",
-    tgUser.last_name || ""
+    tgUser.username || null,
+    tgUser.first_name || null,
+    tgUser.last_name || null
   );
 
   return dbGet(
@@ -420,10 +391,28 @@ async function ensureUser(
 }
 
 /* ============================================================
-   USER / ADMIN
+   EMPLOYEE / ADMIN
    ============================================================ */
 
-async function getUser(
+async function getEmployee(
+  env,
+  telegramId
+) {
+  return dbGet(
+    env,
+    `SELECT *
+     FROM users
+     WHERE telegram_id = ?
+     AND (
+       role = 'admin'
+       OR role = 'moderator'
+     )
+     LIMIT 1`,
+    String(telegramId)
+  );
+}
+
+async function getUserByTelegramId(
   env,
   telegramId
 ) {
@@ -451,26 +440,53 @@ async function getUserById(
   );
 }
 
-async function getAdminRole(
-  env,
-  telegramId
-) {
-  return dbGet(
-    env,
-    `SELECT *
-     FROM admin_roles
-     WHERE telegram_id = ?
-     LIMIT 1`,
-    String(telegramId)
+function isAdminRank(rank) {
+  return (
+    Number(rank) >= 1 &&
+    Number(rank) <= 6
   );
 }
 
-async function getEmployee(
+function isSecretRank(rank) {
+  return (
+    Number(rank) >=
+    SECRET_RANK_MIN
+  );
+}
+
+function hasRank(
+  employee,
+  requiredRank
+) {
+  if (!employee) {
+    return false;
+  }
+
+  return (
+    Number(employee.rank) >=
+    Number(requiredRank)
+  );
+}
+
+function isModerator(
+  employee
+) {
+  return (
+    employee &&
+    employee.role === "moderator"
+  );
+}
+
+/* ============================================================
+   PANEL SESSION
+   ============================================================ */
+
+async function getPanelSession(
   env,
   telegramId
 ) {
   const user =
-    await getUser(
+    await getUserByTelegramId(
       env,
       telegramId
     );
@@ -479,53 +495,77 @@ async function getEmployee(
     return null;
   }
 
-  const adminRole =
-    await getAdminRole(
-      env,
-      telegramId
-    );
-
   if (
-    Number(user.rank) >= ADMIN_RANK_MIN ||
-    user.role === "moderator" ||
-    adminRole
+    Number(user.panel_session) !== 1
   ) {
-    return {
-      ...user,
-      admin_role:
-        adminRole?.role || null
-    };
+    return null;
   }
 
-  return null;
+  return {
+    active: true,
+    panel_type:
+      user.role === "moderator"
+        ? "moderator"
+        : "admin",
+    user_id: user.id
+  };
 }
 
-function isAdminRank(rank) {
-  return (
-    Number(rank) >= 1 &&
-    Number(rank) <= 6
-  );
-}
-
-function hasRank(
+async function createPanelSession(
+  env,
   employee,
-  requiredRank
+  type
 ) {
-  return (
-    !!employee &&
-    Number(employee.rank) >=
-      Number(requiredRank)
+  await dbRun(
+    env,
+    `UPDATE users
+     SET panel_session = 1,
+         panel_status = 'online',
+         panel_last_activity = datetime('now'),
+         last_login_at = datetime('now'),
+         updated_at = datetime('now')
+     WHERE id = ?`,
+    employee.id
+  );
+
+  await registerBotAudit(
+    env,
+    employee.telegram_id,
+    "panel_login",
+    employee.telegram_id,
+    type
   );
 }
 
-function isModerator(
-  employee
+async function closePanelSession(
+  env,
+  telegramId
 ) {
-  return (
-    !!employee &&
-    String(employee.role)
-      .toLowerCase() ===
-      "moderator"
+  await dbRun(
+    env,
+    `UPDATE users
+     SET panel_session = 0,
+         panel_status = 'offline',
+         panel_last_activity = datetime('now'),
+         updated_at = datetime('now')
+     WHERE telegram_id = ?`,
+    String(telegramId)
+  );
+}
+
+async function touchPanelSession(
+  env,
+  telegramId
+) {
+  await dbRun(
+    env,
+    `UPDATE users
+     SET panel_last_activity = datetime('now'),
+         panel_status = 'online',
+         updated_at = datetime('now')
+     WHERE telegram_id = ?
+     AND panel_session = 1`,
+    String(telegramId)
   );
 }
 
@@ -539,12 +579,8 @@ async function registerAdminAction(
   action,
   targetTelegramId = null,
   amount = 0,
-  details = ""
+  details = null
 ) {
-  if (!employee) {
-    return;
-  }
-
   await dbRun(
     env,
     `INSERT INTO admin_actions
@@ -556,225 +592,51 @@ async function registerAdminAction(
        details,
        created_at
      )
-     VALUES
-     (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-    String(employee.telegram_id),
-    String(action),
-    targetTelegramId
-      ? String(targetTelegramId)
-      : null,
+     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+    employee.telegram_id,
+    action,
+    targetTelegramId,
     Number(amount || 0),
     details
-      ? String(details)
-      : null
+  );
+
+  await registerBotAudit(
+    env,
+    employee.telegram_id,
+    action,
+    targetTelegramId,
+    details
   );
 }
 
-/* ============================================================
-   BALANCE
-   ============================================================ */
-
-async function changeBalance(
+async function registerBotAudit(
   env,
-  employee,
-  targetTelegramId,
-  amount,
-  reason
+  actorTelegramId,
+  action,
+  targetTelegramId = null,
+  details = null
 ) {
-  if (
-    !hasRank(
-      employee,
-      SUPER_ADMIN_RANK
-    )
-  ) {
-    return {
-      ok: false,
-      message:
-        "❌ Недостаточно прав."
-    };
-  }
-
-  const user =
-    await getUser(
-      env,
-      targetTelegramId
-    );
-
-  if (!user) {
-    return {
-      ok: false,
-      message:
-        "❌ Пользователь не найден."
-    };
-  }
-
-  const oldBalance =
-    Number(user.balance || 0);
-
-  const newBalance =
-    oldBalance + Number(amount);
-
-  if (newBalance < 0) {
-    return {
-      ok: false,
-      message:
-        "❌ Баланс не может быть отрицательным."
-    };
-  }
-
   await dbRun(
     env,
-    `UPDATE users
-     SET balance = ?,
-         updated_at = datetime('now')
-     WHERE telegram_id = ?`,
-    newBalance,
-    String(targetTelegramId)
-  );
-
-  await dbRun(
-    env,
-    `INSERT INTO balance_audit
+    `INSERT INTO bot_audit
      (
+       bot_name,
        actor_telegram_id,
+       action,
        target_telegram_id,
-       old_balance,
-       new_balance,
-       amount,
-       reason,
-       reference_type,
-       reference_id,
+       details,
        created_at
      )
-     VALUES
-     (?, ?, ?, ?, ?, ?, 'manual', NULL, CURRENT_TIMESTAMP)`,
-    String(employee.telegram_id),
-    String(targetTelegramId),
-    oldBalance,
-    newBalance,
-    Number(amount),
-    String(reason)
+     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+    CONFIG.botName,
+    actorTelegramId || null,
+    action,
+    targetTelegramId || null,
+    details == null
+      ? null
+      : String(details)
   );
-
-  await registerAdminAction(
-    env,
-    employee,
-    "balance_change",
-    targetTelegramId,
-    amount,
-    reason
-  );
-
-  return {
-    ok: true,
-    oldBalance,
-    newBalance
-  };
 }
-
-/* ============================================================
-   UC
-   ============================================================ */
-
-async function changeUC(
-  env,
-  employee,
-  targetTelegramId,
-  amount,
-  reason
-) {
-  if (
-    !hasRank(
-      employee,
-      SUPER_ADMIN_RANK
-    )
-  ) {
-    return {
-      ok: false,
-      message:
-        "❌ Недостаточно прав."
-    };
-  }
-
-  const user =
-    await getUser(
-      env,
-      targetTelegramId
-    );
-
-  if (!user) {
-    return {
-      ok: false,
-      message:
-        "❌ Пользователь не найден."
-    };
-  }
-
-  const oldUC =
-    Number(user.uc || 0);
-
-  const newUC =
-    oldUC + Number(amount);
-
-  if (newUC < 0) {
-    return {
-      ok: false,
-      message:
-        "❌ UC не может быть отрицательным."
-    };
-  }
-
-  await dbRun(
-    env,
-    `UPDATE users
-     SET uc = ?,
-         updated_at = datetime('now')
-     WHERE telegram_id = ?`,
-    newUC,
-    String(targetTelegramId)
-  );
-
-  await dbRun(
-    env,
-    `INSERT INTO uc_audit
-     (
-       actor_telegram_id,
-       target_telegram_id,
-       old_uc,
-       new_uc,
-       amount,
-       reason,
-       created_at
-     )
-     VALUES
-     (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-    String(employee.telegram_id),
-    String(targetTelegramId),
-    oldUC,
-    newUC,
-    Number(amount),
-    String(reason)
-  );
-
-  await registerAdminAction(
-    env,
-    employee,
-    "uc_change",
-    targetTelegramId,
-    amount,
-    reason
-  );
-
-  return {
-    ok: true,
-    oldUC,
-    newUC
-  };
-     }
-/* ============================================================
-   DOXACHKAA UC — worker.js
-   ЧАСТЬ 2/4
-   ============================================================ */
 
 /* ============================================================
    COMMAND ROUTER
@@ -804,26 +666,9 @@ async function handleCommand(
     parts.slice(1);
 
   switch (command) {
-
     case "/start":
       await cmdStart(
         chatId,
-        env
-      );
-      break;
-
-    case "/profile":
-      await cmdProfile(
-        chatId,
-        telegramId,
-        env
-      );
-      break;
-
-    case "/balance":
-      await cmdBalance(
-        chatId,
-        telegramId,
         env
       );
       break;
@@ -844,8 +689,8 @@ async function handleCommand(
       );
       break;
 
-    case "/panel":
     case "/admin":
+    case "/panel":
       await cmdPanel(
         chatId,
         telegramId,
@@ -887,61 +732,50 @@ async function handleCommand(
       break;
 
     case "/logout":
-      await logoutPanel(
+      await closePanelSession(
+        env,
+        telegramId
+      );
+
+      await sendMessage(
+        chatId,
+        "🔒 Сессия панели закрыта.",
+        env
+      );
+      break;
+
+    case "/balance":
+      await cmdBalance(
         chatId,
         telegramId,
         env
       );
       break;
 
-    case "/complaints":
-      await cmdComplaints(
+    case "/uc":
+      await cmdUC(
         chatId,
         telegramId,
         env
       );
       break;
 
-    case "/support":
-      await cmdSupport(
+    case "/wheel":
+      await cmdWheel(
         chatId,
         telegramId,
-        args,
-        env
-      );
-      break;
-
-    case "/spin":
-      await cmdSpin(
-        chatId,
-        telegramId,
-        env
-      );
-      break;
-
-    case "/daily":
-      await cmdDaily(
-        chatId,
-        telegramId,
-        env
-      );
-      break;
-
-    case "/promo":
-      await cmdPromo(
-        chatId,
-        telegramId,
-        args,
         env
       );
       break;
 
     default:
-      await sendMessage(
-        chatId,
-        "❓ Неизвестная команда.",
+      await handleDynamicCommand(
+        command,
+        args,
+        message,
         env
       );
+      break;
   }
 }
 
@@ -959,96 +793,22 @@ async function cmdStart(
 
 Добро пожаловать!
 
-Доступные команды:
+Доступные функции:
 
-/profile — профиль
-/balance — баланс
-/spin — колесо
-/daily — ежедневный бонус
-/promo КОД — промокод
-/support — поддержка
+💰 <code>/balance</code> — баланс
+💎 <code>/uc</code> — UC
+🎡 <code>/wheel</code> — колесо
 
 Для сотрудников:
 
-/alogin — админ-панель
-/hlogin — панель модератора`,
+🔐 <code>/alogin</code> — админ-панель
+🛡 <code>/hlogin</code> — панель модератора`,
     env
   );
 }
 
 /* ============================================================
-   PROFILE
-   ============================================================ */
-
-async function cmdProfile(
-  chatId,
-  telegramId,
-  env
-) {
-  const user =
-    await getUser(
-      env,
-      telegramId
-    );
-
-  if (!user) {
-    return;
-  }
-
-  const rank =
-    RANKS[
-      Number(user.rank)
-    ] || RANKS[0];
-
-  const roleText =
-    user.role === "moderator"
-      ? MODERATOR.name
-      : rank.name;
-
-  await sendMessage(
-    chatId,
-    `<b>👤 ПРОФИЛЬ</b>
-
-Telegram ID:
-<code>${escapeHtml(
-      user.telegram_id
-    )}</code>
-
-Username:
-@${escapeHtml(
-      user.username || "нет"
-    )}
-
-Имя:
-${escapeHtml(
-      user.first_name || "—"
-    )}
-
-Роль:
-<b>${escapeHtml(
-      roleText
-    )}</b>
-
-Ранг:
-<b>${Number(
-      user.rank || 0
-    )}</b>
-
-💰 Баланс:
-<b>${formatMoney(
-      user.balance
-    )} ₽</b>
-
-💎 UC:
-<b>${Number(
-      user.uc || 0
-    )}</b>`,
-    env
-  );
-}
-
-/* ============================================================
-   BALANCE
+   BASIC PLAYER COMMANDS
    ============================================================ */
 
 async function cmdBalance(
@@ -1057,7 +817,7 @@ async function cmdBalance(
   env
 ) {
   const user =
-    await getUser(
+    await getUserByTelegramId(
       env,
       telegramId
     );
@@ -1070,13 +830,34 @@ async function cmdBalance(
     chatId,
     `<b>💰 ВАШ БАЛАНС</b>
 
-Баланс:
-<b>${formatMoney(
+Баланс: <b>${formatMoney(
       user.balance
     )} ₽</b>
+💎 UC: <b>${Number(
+      user.uc || 0
+    )}</b>`,
+    env
+  );
+}
 
-UC:
-<b>${Number(
+async function cmdUC(
+  chatId,
+  telegramId,
+  env
+) {
+  const user =
+    await getUserByTelegramId(
+      env,
+      telegramId
+    );
+
+  if (!user) {
+    return;
+  }
+
+  await sendMessage(
+    chatId,
+    `💎 Ваш баланс UC: <b>${Number(
       user.uc || 0
     )}</b>`,
     env
@@ -1092,15 +873,15 @@ async function cmdALogin(
   telegramId,
   env
 ) {
-  const user =
-    await getUser(
+  const employee =
+    await getEmployee(
       env,
       telegramId
     );
 
   if (
-    !user ||
-    !isAdminRank(user.rank)
+    !employee ||
+    !isAdminRank(employee.rank)
   ) {
     await sendMessage(
       chatId,
@@ -1111,26 +892,57 @@ async function cmdALogin(
     return;
   }
 
-  if (
-    Number(user.panel_session) === 1
-  ) {
-    await sendAdminPanel(
+  const session =
+    await getPanelSession(
+      env,
+      telegramId
+    );
+
+  if (session?.active) {
+    await sendMessage(
       chatId,
-      user,
-      env
+      `<b>🔐 АДМИН-ПАНЕЛЬ</b>
+
+Вы уже авторизованы.`,
+      env,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "🛠 ОТКРЫТЬ ПАНЕЛЬ",
+                callback_data:
+                  "admin_panel"
+              }
+            ],
+            [
+              {
+                text: "🚪 ВЫЙТИ",
+                callback_data:
+                  "panel_logout"
+              }
+            ]
+          ]
+        }
+      }
     );
 
     return;
   }
 
+  /*
+   * В текущей схеме users есть
+   * admin_login_temp и
+   * admin_password_hash.
+   *
+   * Для совместимости используем
+   * временное состояние прямо в users.
+   */
   await dbRun(
     env,
     `UPDATE users
-     SET admin_login_temp = ?,
-         panel_temp_state = 'login',
-         updated_at = datetime('now')
+     SET admin_login_temp = 'waiting'
      WHERE telegram_id = ?`,
-    user.admin_login || "",
     telegramId
   );
 
@@ -1154,17 +966,15 @@ async function cmdHLogin(
   telegramId,
   env
 ) {
-  const user =
-    await getUser(
+  const employee =
+    await getEmployee(
       env,
       telegramId
     );
 
   if (
-    !user ||
-    String(user.role)
-      .toLowerCase() !==
-      "moderator"
+    !employee ||
+    employee.role !== "moderator"
   ) {
     await sendMessage(
       chatId,
@@ -1175,13 +985,39 @@ async function cmdHLogin(
     return;
   }
 
-  if (
-    Number(user.panel_session) === 1
-  ) {
-    await sendModeratorPanel(
+  const session =
+    await getPanelSession(
+      env,
+      telegramId
+    );
+
+  if (session?.active) {
+    await sendMessage(
       chatId,
-      user,
-      env
+      `<b>🛡 ПАНЕЛЬ МОДЕРАТОРА</b>
+
+Вы уже авторизованы.`,
+      env,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "🛡 ОТКРЫТЬ ПАНЕЛЬ",
+                callback_data:
+                  "moder_panel"
+              }
+            ],
+            [
+              {
+                text: "🚪 ВЫЙТИ",
+                callback_data:
+                  "panel_logout"
+              }
+            ]
+          ]
+        }
+      }
     );
 
     return;
@@ -1190,8 +1026,7 @@ async function cmdHLogin(
   await dbRun(
     env,
     `UPDATE users
-     SET panel_temp_state = 'login',
-         updated_at = datetime('now')
+     SET admin_login_temp = 'waiting_moderator'
      WHERE telegram_id = ?`,
     telegramId
   );
@@ -1200,13 +1035,12 @@ async function cmdHLogin(
     chatId,
     `<b>🛡 ПАНЕЛЬ МОДЕРАТОРА</b>
 
-Введите логин и пароль:
+Введите:
 
 <code>логин пароль</code>`,
     env
   );
 }
-
 /* ============================================================
    AUTH INPUT
    ============================================================ */
@@ -1219,15 +1053,23 @@ async function processAuthInput(
     String(message.from.id);
 
   const user =
-    await getUser(
+    await getUserByTelegramId(
       env,
       telegramId
     );
 
+  if (!user) {
+    return false;
+  }
+
+  const state =
+    String(
+      user.admin_login_temp || ""
+    );
+
   if (
-    !user ||
-    user.panel_temp_state !==
-      "login"
+    state !== "waiting" &&
+    state !== "waiting_moderator"
   ) {
     return false;
   }
@@ -1247,17 +1089,24 @@ async function processAuthInput(
     return true;
   }
 
-  const login =
-    values[0];
+  const login = values[0];
+  const password = values[1];
 
-  const password =
-    values.slice(1).join(" ");
+  const employee =
+    await dbGet(
+      env,
+      `SELECT *
+       FROM users
+       WHERE admin_login = ?
+       AND (
+         role = 'admin'
+         OR role = 'moderator'
+       )
+       LIMIT 1`,
+      login
+    );
 
-  if (
-    !user.admin_login ||
-    login !==
-      user.admin_login
-  ) {
+  if (!employee) {
     await sendMessage(
       message.chat.id,
       "❌ Неверный логин или пароль.",
@@ -1267,13 +1116,25 @@ async function processAuthInput(
     return true;
   }
 
-  const valid =
+  /*
+   * В базе поле называется
+   * admin_password_hash.
+   *
+   * Поддерживаем два варианта:
+   *
+   * 1. plain text — для старой конфигурации;
+   * 2. SHA-256 hash — для нормальной конфигурации.
+   */
+  const passwordOk =
     await verifyPassword(
       password,
-      user.admin_password_hash
+      employee.admin_password_hash
     );
 
-  if (!valid) {
+  if (
+    !passwordOk ||
+    String(employee.telegram_id) !== telegramId
+  ) {
     await sendMessage(
       message.chat.id,
       "❌ Неверный логин или пароль.",
@@ -1284,60 +1145,64 @@ async function processAuthInput(
   }
 
   if (
-    !isAdminRank(user.rank) &&
-    user.role !== "moderator"
+    state === "waiting" &&
+    !isAdminRank(employee.rank)
   ) {
     await sendMessage(
       message.chat.id,
-      "❌ Недостаточно прав.",
+      "❌ Этот аккаунт не является администратором.",
       env
     );
 
     return true;
   }
+
+  if (
+    state === "waiting_moderator" &&
+    employee.role !== "moderator"
+  ) {
+    await sendMessage(
+      message.chat.id,
+      "❌ Этот аккаунт не является модератором.",
+      env
+    );
+
+    return true;
+  }
+
+  await createPanelSession(
+    env,
+    employee,
+    state === "waiting"
+      ? "admin"
+      : "moderator"
+  );
 
   await dbRun(
     env,
     `UPDATE users
-     SET panel_session = 1,
-         panel_last_activity = datetime('now'),
+     SET admin_login_temp = NULL,
          last_login_at = datetime('now'),
+         panel_last_activity = datetime('now'),
          panel_status = 'online',
-         panel_temp_state = NULL,
+         panel_session = 1,
          updated_at = datetime('now')
-     WHERE telegram_id = ?`,
-    telegramId
+     WHERE id = ?`,
+    employee.id
   );
-
-  await registerAdminAction(
-    env,
-    user,
-    "panel_login",
-    telegramId,
-    0,
-    "Успешный вход"
-  );
-
-  const fresh =
-    await getUser(
-      env,
-      telegramId
-    );
 
   if (
-    fresh.role ===
-      "moderator" &&
-    !isAdminRank(fresh.rank)
+    state === "waiting"
   ) {
-    await sendModeratorPanel(
+    await sendAdminPanel(
       message.chat.id,
-      fresh,
+      employee,
       env
     );
   } else {
-    await sendAdminPanel(
+    await sendModeratorPanel(
       message.chat.id,
-      fresh,
+      employee,
       env
     );
   }
@@ -1346,14 +1211,17 @@ async function processAuthInput(
 }
 
 /* ============================================================
-   PASSWORD
+   PASSWORD VERIFY
    ============================================================ */
 
 async function verifyPassword(
   password,
   stored
 ) {
-  if (!stored) {
+  if (
+    stored === null ||
+    stored === undefined
+  ) {
     return false;
   }
 
@@ -1361,58 +1229,47 @@ async function verifyPassword(
     String(stored);
 
   /*
-   * Поддерживаем SHA-256 в формате:
-   * sha256:HEX
-   *
-   * Также поддерживаем чистый HEX SHA-256.
+   * Совместимость со старым вариантом,
+   * где пароль мог храниться напрямую.
    */
-  const hash =
-    await sha256(password);
-
-  if (
-    value.toLowerCase() ===
-    `sha256:${hash}`.toLowerCase()
-  ) {
-    return true;
-  }
-
-  if (
-    value.toLowerCase() ===
-    hash.toLowerCase()
-  ) {
+  if (value === String(password)) {
     return true;
   }
 
   /*
-   * Если в старой базе пароль временно
-   * хранится открытым текстом.
+   * SHA-256.
    */
-  return value ===
-    String(password);
-}
+  try {
+    const data =
+      new TextEncoder().encode(
+        String(password)
+      );
 
-async function sha256(
-  text
-) {
-  const data =
-    new TextEncoder()
-      .encode(String(text));
+    const hash =
+      await crypto.subtle.digest(
+        "SHA-256",
+        data
+      );
 
-  const digest =
-    await crypto.subtle.digest(
-      "SHA-256",
-      data
-    );
+    const bytes =
+      Array.from(
+        new Uint8Array(hash)
+      );
 
-  return Array.from(
-    new Uint8Array(digest)
-  )
-    .map(
-      b => b
-        .toString(16)
-        .padStart(2, "0")
-    )
-    .join("");
+    const hex =
+      bytes
+        .map(
+          byte =>
+            byte
+              .toString(16)
+              .padStart(2, "0")
+        )
+        .join("");
+
+    return hex === value;
+  } catch {
+    return false;
+  }
 }
 
 /* ============================================================
@@ -1424,98 +1281,62 @@ async function cmdPanel(
   telegramId,
   env
 ) {
-  const user =
-    await getUser(
+  const employee =
+    await getEmployee(
       env,
       telegramId
     );
 
-  if (!user) {
-    return;
-  }
-
-  if (
-    Number(user.panel_session) !== 1
-  ) {
+  if (!employee) {
     await sendMessage(
       chatId,
-      "❌ Сначала авторизуйтесь через /alogin или /hlogin.",
+      "❌ Доступ запрещён.",
       env
     );
 
     return;
   }
 
-  await dbRun(
+  const session =
+    await getPanelSession(
+      env,
+      telegramId
+    );
+
+  if (
+    !session ||
+    !session.active
+  ) {
+    await sendMessage(
+      chatId,
+      "❌ Сначала авторизуйтесь.",
+      env
+    );
+
+    return;
+  }
+
+  await touchPanelSession(
     env,
-    `UPDATE users
-     SET panel_last_activity = datetime('now'),
-         updated_at = datetime('now')
-     WHERE telegram_id = ?`,
     telegramId
   );
 
   if (
-    user.role === "moderator" &&
-    !isAdminRank(user.rank)
+    session.panel_type ===
+    "moderator"
   ) {
     await sendModeratorPanel(
       chatId,
-      user,
+      employee,
       env
     );
   } else {
     await sendAdminPanel(
       chatId,
-      user,
+      employee,
       env
     );
   }
-}
-
-/* ============================================================
-   LOGOUT
-   ============================================================ */
-
-async function logoutPanel(
-  chatId,
-  telegramId,
-  env
-) {
-  const user =
-    await getUser(
-      env,
-      telegramId
-    );
-
-  await dbRun(
-    env,
-    `UPDATE users
-     SET panel_session = 0,
-         panel_status = 'offline',
-         panel_temp_state = NULL,
-         panel_last_activity = datetime('now'),
-         updated_at = datetime('now')
-     WHERE telegram_id = ?`,
-    telegramId
-  );
-
-  if (user) {
-    await registerAdminAction(
-      env,
-      user,
-      "panel_logout",
-      telegramId,
-      0,
-      "Выход из панели"
-    );
-  }
-
-  await sendMessage(
-    chatId,
-    "🔒 Сессия панели закрыта.",
-    env
-  );
 }
 
 /* ============================================================
@@ -1528,84 +1349,146 @@ async function sendAdminPanel(
   env
 ) {
   const rank =
-    RANKS[
-      Number(employee.rank)
-    ] || RANKS[0];
+    Number(employee.rank);
+
+  const roleName =
+    RANKS[rank]?.name ||
+    employee.role;
+
+  const keyboard = [];
+
+  keyboard.push([
+    {
+      text: "👤 ПОЛЬЗОВАТЕЛИ",
+      callback_data:
+        "users_list"
+    },
+    {
+      text: "🔎 ПОИСК",
+      callback_data:
+        "global_search"
+    }
+  ]);
+
+  keyboard.push([
+    {
+      text: "💰 БАЛАНС",
+      callback_data:
+        "balance_menu"
+    },
+    {
+      text: "💎 UC",
+      callback_data:
+        "uc_menu"
+    }
+  ]);
+
+  keyboard.push([
+    {
+      text: "🎡 КОЛЕСО",
+      callback_data:
+        "wheel_menu"
+    },
+    {
+      text: "📊 СТАТИСТИКА",
+      callback_data:
+        "admin_stats"
+    }
+  ]);
+
+  keyboard.push([
+    {
+      text: "📝 ЖАЛОБЫ",
+      callback_data:
+        "moder_complaints"
+    },
+    {
+      text: "🛡 МОДЕРАЦИЯ",
+      callback_data:
+        "moder_list"
+    }
+  ]);
+
+  keyboard.push([
+    {
+      text: "🎫 ПОДДЕРЖКА",
+      callback_data:
+        "support_menu"
+    },
+    {
+      text: "💳 ПЛАТЕЖИ",
+      callback_data:
+        "payments_menu"
+    }
+  ]);
+
+  if (rank >= 5) {
+    keyboard.push([
+      {
+        text: "⚙️ НАСТРОЙКИ",
+        callback_data:
+          "settings_menu"
+      },
+      {
+        text: "🚨 EMERGENCY",
+        callback_data:
+          "emergency_menu"
+      }
+    ]);
+
+    keyboard.push([
+      {
+        text: "👮 СОТРУДНИКИ",
+        callback_data:
+          "employees_menu"
+      }
+    ]);
+  }
+
+  keyboard.push([
+    {
+      text: "📋 МОЯ АКТИВНОСТЬ",
+      callback_data:
+        "my_activity"
+    }
+  ]);
+
+  keyboard.push([
+    {
+      text: "🚪 ВЫЙТИ",
+      callback_data:
+        "panel_logout"
+    }
+  ]);
 
   await sendMessage(
     chatId,
     `<b>🛠 АДМИН-ПАНЕЛЬ</b>
 
-Сотрудник:
-<b>${escapeHtml(
+👤 ${escapeHtml(
       employee.first_name ||
       employee.username ||
-      employee.telegram_id
-    )}</b>
+      "Сотрудник"
+    )}
 
-Ранг:
-<b>${Number(
-      employee.rank
-    )} — ${escapeHtml(
-      rank.name
+🎖 Ранг: <b>${rank}</b>
+🏷 ${escapeHtml(
+      roleName
+    )}
+
+💰 Баланс: <b>${formatMoney(
+      employee.balance
+    )} ₽</b>
+💎 UC: <b>${Number(
+      employee.uc || 0
     )}</b>
 
 Выберите раздел:`,
     env,
     {
       reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "👥 АДМИНЫ",
-              callback_data:
-                "admins_list"
-            },
-            {
-              text: "🛡 МОДЕРАТОРЫ",
-              callback_data:
-                "moder_list"
-            }
-          ],
-          [
-            {
-              text: "🔎 ПОИСК",
-              callback_data:
-                "global_search"
-            },
-            {
-              text: "📋 ЖАЛОБЫ",
-              callback_data:
-                "moder_complaints"
-            }
-          ],
-          [
-            {
-              text: "🎡 КОЛЕСО",
-              callback_data:
-                "wheel_menu"
-            },
-            {
-              text: "💰 БАЛАНС / UC",
-              callback_data:
-                "finance_menu"
-            }
-          ],
-          [
-            {
-              text: "📊 МОЯ АКТИВНОСТЬ",
-              callback_data:
-                "my_activity"
-            }
-          ],
-          [
-            {
-              text: "🚪 ВЫЙТИ",
-              callback_data:
-                "panel_logout"
-            }
-          ]
-        ]
+        inline_keyboard:
+          keyboard
       }
     }
   );
@@ -1624,23 +1507,31 @@ async function sendModeratorPanel(
     chatId,
     `<b>🛡 ПАНЕЛЬ МОДЕРАТОРА</b>
 
-Доступные действия:`,
+👤 ${escapeHtml(
+      employee.first_name ||
+      employee.username ||
+      "Модератор"
+    )}
+
+🏷 Роль: <b>Модератор</b>
+
+Выберите раздел:`,
     env,
     {
       reply_markup: {
         inline_keyboard: [
           [
             {
-              text: "📋 ЖАЛОБЫ",
+              text: "📝 ЖАЛОБЫ",
               callback_data:
                 "moder_complaints"
             }
           ],
           [
             {
-              text: "🔎 ПОИСК ИГРОКА",
+              text: "👥 ПОЛЬЗОВАТЕЛИ",
               callback_data:
-                "global_search"
+                "users_list"
             }
           ],
           [
@@ -1661,656 +1552,6 @@ async function sendModeratorPanel(
       }
     }
   );
-     }
-/* ============================================================
-   DOXACHKAA UC — worker.js
-   ЧАСТЬ 3/4
-   ============================================================ */
-
-/* ============================================================
-   CALLBACK ROUTER
-   ============================================================ */
-
-async function handleCallback(
-  callback,
-  env
-) {
-  const data =
-    String(
-      callback.data || ""
-    );
-
-  const chatId =
-    callback.message?.chat?.id;
-
-  const messageId =
-    callback.message?.message_id;
-
-  const telegramId =
-    String(callback.from.id);
-
-  await answerCallback(
-    callback.id,
-    env
-  );
-
-  if (!chatId) {
-    return;
-  }
-
-  const employee =
-    await getEmployee(
-      env,
-      telegramId
-    );
-
-  if (
-    data === "panel_logout"
-  ) {
-    await logoutPanel(
-      chatId,
-      telegramId,
-      env
-    );
-
-    return;
-  }
-
-  if (
-    data === "admin_panel"
-  ) {
-    await cmdPanel(
-      chatId,
-      telegramId,
-      env
-    );
-
-    return;
-  }
-
-  if (
-    data === "moder_panel"
-  ) {
-    await cmdPanel(
-      chatId,
-      telegramId,
-      env
-    );
-
-    return;
-  }
-
-  if (!employee) {
-    await sendMessage(
-      chatId,
-      "❌ Доступ запрещён.",
-      env
-    );
-
-    return;
-  }
-
-  if (
-    Number(employee.panel_session) !== 1
-  ) {
-    await sendMessage(
-      chatId,
-      "❌ Сессия панели завершена.",
-      env
-    );
-
-    return;
-  }
-
-  await dbRun(
-    env,
-    `UPDATE users
-     SET panel_last_activity = datetime('now'),
-         updated_at = datetime('now')
-     WHERE telegram_id = ?`,
-    telegramId
-  );
-
-  switch (data) {
-
-    case "admins_list":
-      await cmdAdmins(
-        chatId,
-        telegramId,
-        env
-      );
-      return;
-
-    case "moder_list":
-      await cmdModer(
-        chatId,
-        env
-      );
-      return;
-
-    case "moder_complaints":
-      await showComplaints(
-        chatId,
-        employee,
-        env
-      );
-      return;
-
-    case "global_search":
-      await requestPanelState(
-        env,
-        telegramId,
-        "search",
-        chatId,
-        "🔎 Введите Telegram ID или ID пользователя:"
-      );
-      return;
-
-    case "finance_menu":
-      await showFinanceMenu(
-        chatId,
-        employee,
-        env
-      );
-      return;
-
-    case "wheel_menu":
-      await showWheelMenu(
-        chatId,
-        employee,
-        env
-      );
-      return;
-
-    case "wheel_price":
-      if (!hasRank(employee, 5)) {
-        await sendMessage(
-          chatId,
-          "❌ Требуется 5+ ранг.",
-          env
-        );
-        return;
-      }
-
-      await requestPanelState(
-        env,
-        telegramId,
-        "wheel_price",
-        chatId,
-        "💰 Введите новую цену вращения в ₽:"
-      );
-      return;
-
-    case "wheel_enable":
-      if (!hasRank(employee, 5)) {
-        return;
-      }
-
-      await setWheelEnabled(
-        env,
-        employee,
-        chatId,
-        true
-      );
-      return;
-
-    case "wheel_disable":
-      if (!hasRank(employee, 5)) {
-        return;
-      }
-
-      await setWheelEnabled(
-        env,
-        employee,
-        chatId,
-        false
-      );
-      return;
-
-    case "wheel_history":
-      await showWheelHistory(
-        chatId,
-        employee,
-        env
-      );
-      return;
-
-    case "wheel_prizes":
-      await showWheelPrizes(
-        chatId,
-        env
-      );
-      return;
-
-    case "my_activity":
-      await showActivity(
-        chatId,
-        employee,
-        env
-      );
-      return;
-
-    case "create_employee":
-      if (!hasRank(employee, 5)) {
-        return;
-      }
-
-      await requestPanelState(
-        env,
-        telegramId,
-        "create_employee",
-        chatId,
-        `👤 Создание сотрудника.
-
-Формат:
-<code>TelegramID Логин Пароль Ранг Роль</code>
-
-Роль:
-admin или moderator`
-      );
-      return;
-
-    default:
-      break;
-  }
-
-  if (
-    data.startsWith("complaint_")
-  ) {
-    const id =
-      Number(
-        data.replace(
-          "complaint_",
-          ""
-        )
-      );
-
-    await reviewComplaint(
-      chatId,
-      employee,
-      id,
-      env
-    );
-
-    return;
-  }
-
-  if (
-    data.startsWith("ticket_")
-  ) {
-    const id =
-      Number(
-        data.replace(
-          "ticket_",
-          ""
-        )
-      );
-
-    await showTicket(
-      chatId,
-      employee,
-      id,
-      env
-    );
-
-    return;
-  }
-}
-
-/* ============================================================
-   PANEL TEXT STATES
-   ============================================================ */
-
-async function requestPanelState(
-  env,
-  telegramId,
-  state,
-  chatId,
-  text
-) {
-  await dbRun(
-    env,
-    `UPDATE users
-     SET panel_temp_state = ?,
-         updated_at = datetime('now')
-     WHERE telegram_id = ?`,
-    state,
-    String(telegramId)
-  );
-
-  await sendMessage(
-    chatId,
-    text,
-    env
-  );
-}
-
-async function clearPanelState(
-  env,
-  telegramId
-) {
-  await dbRun(
-    env,
-    `UPDATE users
-     SET panel_temp_state = NULL,
-         updated_at = datetime('now')
-     WHERE telegram_id = ?`,
-    String(telegramId)
-  );
-}
-
-async function handleTextState(
-  message,
-  env
-) {
-  const telegramId =
-    String(message.from.id);
-
-  const user =
-    await getUser(
-      env,
-      telegramId
-    );
-
-  if (
-    !user ||
-    !user.panel_temp_state
-  ) {
-    return false;
-  }
-
-  const value =
-    String(message.text || "")
-      .trim();
-
-  if (!value) {
-    return true;
-  }
-
-  switch (
-    user.panel_temp_state
-  ) {
-
-    case "search": {
-      await clearPanelState(
-        env,
-        telegramId
-      );
-
-      const result =
-        await globalSearch(
-          env,
-          value
-        );
-
-      await sendSearchResult(
-        message.chat.id,
-        result,
-        env
-      );
-
-      return true;
-    }
-
-    case "wheel_price": {
-      if (!hasRank(user, 5)) {
-        await clearPanelState(
-          env,
-          telegramId
-        );
-        return true;
-      }
-
-      const price =
-        Number(value);
-
-      if (
-        !Number.isFinite(price) ||
-        price < 0
-      ) {
-        await sendMessage(
-          message.chat.id,
-          "❌ Цена должна быть числом не меньше 0.",
-          env
-        );
-
-        return true;
-      }
-
-      await dbRun(
-        env,
-        `UPDATE wheel_settings
-         SET spin_cost = ?,
-             updated_by = ?,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = (
-           SELECT id
-           FROM wheel_settings
-           ORDER BY id
-           LIMIT 1
-         )`,
-        price,
-        String(telegramId)
-      );
-
-      await registerAdminAction(
-        env,
-        user,
-        "wheel_price_change",
-        null,
-        price,
-        `Цена вращения: ${price}`
-      );
-
-      await clearPanelState(
-        env,
-        telegramId
-      );
-
-      await sendMessage(
-        message.chat.id,
-        `✅ Цена вращения установлена: <b>${formatMoney(
-          price
-        )} ₽</b>`,
-        env
-      );
-
-      return true;
-    }
-
-    case "create_employee": {
-      if (!hasRank(user, 5)) {
-        await clearPanelState(
-          env,
-          telegramId
-        );
-        return true;
-      }
-
-      const parts =
-        value.split(/\s+/);
-
-      if (parts.length < 5) {
-        await sendMessage(
-          message.chat.id,
-          `❌ Формат:
-
-<code>TelegramID Логин Пароль Ранг Роль</code>`,
-          env
-        );
-
-        return true;
-      }
-
-      const targetTelegramId =
-        parts[0];
-
-      const login =
-        parts[1];
-
-      const password =
-        parts[2];
-
-      const rank =
-        Number(parts[3]);
-
-      const role =
-        String(parts[4])
-          .toLowerCase();
-
-      if (
-        !Number.isFinite(rank) ||
-        rank < 1 ||
-        rank > Number(user.rank)
-      ) {
-        await sendMessage(
-          message.chat.id,
-          "❌ Нельзя выдать ранг выше своего.",
-          env
-        );
-
-        return true;
-      }
-
-      if (
-        !["admin", "moderator"]
-          .includes(role)
-      ) {
-        await sendMessage(
-          message.chat.id,
-          "❌ Роль должна быть admin или moderator.",
-          env
-        );
-
-        return true;
-      }
-
-      const existing =
-        await getUser(
-          env,
-          targetTelegramId
-        );
-
-      if (existing) {
-        await sendMessage(
-          message.chat.id,
-          "❌ Пользователь уже существует.",
-          env
-        );
-
-        return true;
-      }
-
-      const passwordHash =
-        `sha256:${await sha256(
-          password
-        )}`;
-
-      await dbRun(
-        env,
-        `INSERT INTO users
-         (
-           telegram_id,
-           username,
-           first_name,
-           last_name,
-           role,
-           rank,
-           balance,
-           uc,
-           created_at,
-           updated_at,
-           admin_login,
-           admin_password_hash,
-           panel_session,
-           panel_status
-         )
-         VALUES
-         (?, ?, '', '', ?, ?, 0, 0,
-          CURRENT_TIMESTAMP,
-          CURRENT_TIMESTAMP,
-          ?, ?, 0, 'offline')`,
-        targetTelegramId,
-        login,
-        role,
-        role === "moderator"
-          ? 0
-          : rank,
-        login,
-        passwordHash
-      );
-
-      if (role === "admin") {
-        await dbRun(
-          env,
-          `INSERT OR REPLACE INTO admin_roles
-           (
-             telegram_id,
-             role,
-             granted_by,
-             created_at
-           )
-           VALUES
-           (?, ?, ?, CURRENT_TIMESTAMP)`,
-          targetTelegramId,
-          "admin",
-          String(
-            user.telegram_id
-          )
-        );
-      }
-
-      await registerAdminAction(
-        env,
-        user,
-        "employee_create",
-        targetTelegramId,
-        0,
-        `login=${login}; rank=${rank}; role=${role}`
-      );
-
-      await clearPanelState(
-        env,
-        telegramId
-      );
-
-      await sendMessage(
-        message.chat.id,
-        `✅ Сотрудник создан.
-
-Telegram ID:
-<code>${escapeHtml(
-          targetTelegramId
-        )}</code>
-
-Логин:
-<code>${escapeHtml(
-          login
-        )}</code>
-
-Пароль:
-<code>${escapeHtml(
-          password
-        )}</code>
-
-Роль:
-<b>${escapeHtml(
-          role
-        )}</b>
-
-Ранг:
-<b>${role === "moderator"
-          ? 0
-          : rank}</b>`,
-        env
-      );
-
-      return true;
-    }
-
-    default:
-      return false;
-  }
 }
 
 /* ============================================================
@@ -2330,82 +1571,76 @@ async function cmdAdmins(
 
   if (
     !employee ||
-    Number(employee.panel_session) !== 1
+    !isAdminRank(employee.rank)
   ) {
+    await sendMessage(
+      chatId,
+      "❌ Доступ запрещён.",
+      env
+    );
+
     return;
   }
 
-  const rows =
+  const admins =
     await dbAll(
       env,
-      `SELECT telegram_id,
-              username,
-              first_name,
-              role,
-              rank,
-              panel_status
+      `SELECT
+         id,
+         telegram_id,
+         username,
+         first_name,
+         last_name,
+         role,
+         rank,
+         panel_status,
+         last_login_at
        FROM users
-       WHERE rank >= 1
-       ORDER BY rank DESC, id ASC
-       LIMIT 100`
+       WHERE role = 'admin'
+       ORDER BY rank DESC, id ASC`
     );
 
-  let text =
-    "<b>👥 АДМИНИСТРАЦИЯ</b>\n\n";
+  if (!admins.length) {
+    await sendMessage(
+      chatId,
+      "👮 Администраторов нет.",
+      env
+    );
 
-  if (!rows.length) {
-    text += "Список пуст.";
+    return;
   }
 
-  for (const row of rows) {
+  let text =
+    "<b>👮 АДМИНИСТРАТОРЫ</b>\n\n";
+
+  for (const admin of admins) {
     const rank =
-      RANKS[
-        Number(row.rank)
-      ] || RANKS[0];
+      Number(admin.rank);
+
+    const status =
+      admin.panel_status === "online"
+        ? "🟢"
+        : "⚪";
 
     text +=
-      `• <b>${escapeHtml(
-        row.first_name ||
-        row.username ||
-        row.telegram_id
+      `${status} <b>${escapeHtml(
+        admin.first_name ||
+        admin.username ||
+        admin.telegram_id
       )}</b>\n` +
-      `  ID: <code>${escapeHtml(
-        row.telegram_id
+      `ID: <code>${escapeHtml(
+        admin.telegram_id
       )}</code>\n` +
-      `  Ранг: ${Number(
-        row.rank
-      )} — ${escapeHtml(
-        rank.name
-      )}\n` +
-      `  Статус: ${escapeHtml(
-        row.panel_status || "offline"
+      `Ранг: <b>${rank}</b> — ${escapeHtml(
+        RANKS[rank]?.name ||
+        "Неизвестно"
       )}\n\n`;
   }
 
   await sendMessage(
     chatId,
     text,
-    env,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "➕ СОЗДАТЬ",
-              callback_data:
-                "create_employee"
-            }
-          ],
-          [
-            {
-              text: "⬅️ ПАНЕЛЬ",
-              callback_data:
-                "admin_panel"
-            }
-          ]
-        ]
-      }
-    }
+    env
   );
 }
 
@@ -2417,1205 +1652,60 @@ async function cmdModer(
   chatId,
   env
 ) {
-  const rows =
+  const moderators =
     await dbAll(
       env,
-      `SELECT telegram_id,
-              username,
-              first_name,
-              panel_status
+      `SELECT
+         id,
+         telegram_id,
+         username,
+         first_name,
+         last_name,
+         role,
+         rank,
+         panel_status
        FROM users
        WHERE role = 'moderator'
-       ORDER BY id DESC
-       LIMIT 100`
+       ORDER BY id ASC`
     );
+
+  if (!moderators.length) {
+    await sendMessage(
+      chatId,
+      "🛡 Модераторов нет.",
+      env
+    );
+
+    return;
+  }
 
   let text =
     "<b>🛡 МОДЕРАТОРЫ</b>\n\n";
 
-  if (!rows.length) {
-    text += "Список пуст.";
-  }
+  for (
+    const moderator
+    of moderators
+  ) {
+    const status =
+      moderator.panel_status ===
+      "online"
+        ? "🟢"
+        : "⚪";
 
-  for (const row of rows) {
     text +=
-      `• <b>${escapeHtml(
-        row.first_name ||
-        row.username ||
-        row.telegram_id
-      )}</b>\n` +
-      `  ID: <code>${escapeHtml(
-        row.telegram_id
-      )}</code>\n` +
-      `  Статус: ${escapeHtml(
-        row.panel_status || "offline"
-      )}\n\n`;
-  }
-
-  await sendMessage(
-    chatId,
-    text,
-    env
-  );
-               }
-/* ============================================================
-   DOXACHKAA UC — worker.js
-   ЧАСТЬ 4/4
-   ============================================================ */
-
-/* ============================================================
-   SEARCH
-   ============================================================ */
-
-async function globalSearch(
-  env,
-  query
-) {
-  const q =
-    String(query || "")
-      .trim();
-
-  if (!q) {
-    return {
-      users: [],
-      payments: [],
-      topups: [],
-      payouts: []
-    };
-  }
-
-  const users =
-    await dbAll(
-      env,
-      `SELECT *
-       FROM users
-       WHERE telegram_id = ?
-          OR CAST(id AS TEXT) = ?
-          OR username LIKE ?
-          OR admin_login = ?
-       ORDER BY id DESC
-       LIMIT 20`,
-      q,
-      q,
-      `%${q}%`,
-      q
-    );
-
-  const payments =
-    await dbAll(
-      env,
-      `SELECT *
-       FROM payments
-       WHERE telegram_id = ?
-       ORDER BY id DESC
-       LIMIT 20`,
-      q
-    );
-
-  const topups =
-    await dbAll(
-      env,
-      `SELECT *
-       FROM topup_requests
-       WHERE telegram_id = ?
-       ORDER BY id DESC
-       LIMIT 20`,
-      q
-    );
-
-  const payouts =
-    await dbAll(
-      env,
-      `SELECT *
-       FROM payout_requests
-       WHERE telegram_id = ?
-       ORDER BY id DESC
-       LIMIT 20`,
-      q
-    );
-
-  return {
-    users,
-    payments,
-    topups,
-    payouts
-  };
-}
-
-async function sendSearchResult(
-  chatId,
-  result,
-  env
-) {
-  let text =
-    "<b>🔎 РЕЗУЛЬТАТ ПОИСКА</b>\n\n";
-
-  if (!result.users.length) {
-    text +=
-      "Пользователи не найдены.\n";
-  }
-
-  for (const user of result.users) {
-    text +=
-      `👤 <b>${escapeHtml(
-        user.first_name ||
-        user.username ||
-        "Пользователь"
+      `${status} <b>${escapeHtml(
+        moderator.first_name ||
+        moderator.username ||
+        moderator.telegram_id
       )}</b>\n` +
       `ID: <code>${escapeHtml(
-        user.telegram_id
-      )}</code>\n` +
-      `Баланс: <b>${formatMoney(
-        user.balance
-      )} ₽</b>\n` +
-      `UC: <b>${Number(
-        user.uc || 0
-      )}</b>\n\n`;
-  }
-
-  if (result.payments.length) {
-    text +=
-      "<b>💳 ПЛАТЕЖИ</b>\n\n";
-
-    for (const row of result.payments) {
-      text +=
-        `#${row.id} — ${formatMoney(
-          row.amount
-        )} ${escapeHtml(
-          row.currency || "RUB"
-        )} — ${escapeHtml(
-          row.status
-        )}\n`;
-    }
-
-    text += "\n";
-  }
-
-  if (result.topups.length) {
-    text +=
-      "<b>💰 ПОПОЛНЕНИЯ</b>\n\n";
-
-    for (const row of result.topups) {
-      text +=
-        `#${row.id} — ${formatMoney(
-          row.amount
-        )} ₽ — ${escapeHtml(
-          row.status || "pending"
-        )}\n`;
-    }
-
-    text += "\n";
-  }
-
-  if (result.payouts.length) {
-    text +=
-      "<b>💎 ВЫВОДЫ UC</b>\n\n";
-
-    for (const row of result.payouts) {
-      text +=
-        `#${row.id} — ${Number(
-          row.uc_amount || 0
-        )} UC — ${escapeHtml(
-          row.status || "pending"
-        )}\n`;
-    }
+        moderator.telegram_id
+      )}</code>\n\n`;
   }
 
   await sendMessage(
     chatId,
     text,
-    env
-  );
-}
-
-/* ============================================================
-   COMPLAINTS
-   ============================================================ */
-
-async function cmdComplaints(
-  chatId,
-  telegramId,
-  env
-) {
-  const employee =
-    await getEmployee(
-      env,
-      telegramId
-    );
-
-  if (!employee) {
-    return;
-  }
-
-  await showComplaints(
-    chatId,
-    employee,
-    env
-  );
-}
-
-async function showComplaints(
-  chatId,
-  employee,
-  env
-) {
-  const rows =
-    await dbAll(
-      env,
-      `SELECT *
-       FROM complaints
-       WHERE status = 'pending'
-       ORDER BY id DESC
-       LIMIT 20`
-    );
-
-  let text =
-    "<b>📋 ЖАЛОБЫ</b>\n\n";
-
-  if (!rows.length) {
-    text += "Новых жалоб нет.";
-
-    await sendMessage(
-      chatId,
-      text,
-      env
-    );
-
-    return;
-  }
-
-  const buttons = [];
-
-  for (const row of rows) {
-    text +=
-      `#${row.id} — ` +
-      `${escapeHtml(
-        row.target_role
-      )}\n` +
-      `От: <code>${escapeHtml(
-        row.reporter_telegram_id
-      )}</code>\n` +
-      `На: <code>${escapeHtml(
-        row.target_telegram_id
-      )}</code>\n` +
-      `${escapeHtml(
-        row.complaint_text
-      )}\n\n`;
-
-    buttons.push([
-      {
-        text: `📋 Жалоба #${row.id}`,
-        callback_data:
-          `complaint_${row.id}`
-      }
-    ]);
-  }
-
-  await sendMessage(
-    chatId,
-    text,
-    env,
-    {
-      reply_markup: {
-        inline_keyboard:
-          buttons
-      }
-    }
-  );
-}
-
-async function reviewComplaint(
-  chatId,
-  employee,
-  complaintId,
-  env
-) {
-  if (!employee) {
-    return;
-  }
-
-  const complaint =
-    await dbGet(
-      env,
-      `SELECT *
-       FROM complaints
-       WHERE id = ?
-       LIMIT 1`,
-      complaintId
-    );
-
-  if (!complaint) {
-    await sendMessage(
-      chatId,
-      "❌ Жалоба не найдена.",
-      env
-    );
-
-    return;
-  }
-
-  await dbRun(
-    env,
-    `UPDATE complaints
-     SET status = 'reviewed',
-         reviewed_by = ?,
-         reviewed_at = CURRENT_TIMESTAMP,
-         resolution = ?
-     WHERE id = ?`,
-    String(employee.telegram_id),
-    "Рассмотрено администрацией",
-    complaintId
-  );
-
-  await registerAdminAction(
-    env,
-    employee,
-    "complaint_review",
-    complaint.target_telegram_id,
-    0,
-    `complaint_id=${complaintId}`
-  );
-
-  await sendMessage(
-    chatId,
-    `✅ Жалоба #${complaintId} отмечена как рассмотренная.`,
-    env
-  );
-}
-
-/* ============================================================
-   SUPPORT
-   ============================================================ */
-
-async function cmdSupport(
-  chatId,
-  telegramId,
-  args,
-  env
-) {
-  const text =
-    args.length
-      ? args.join(" ")
-      : "";
-
-  if (!text) {
-    await sendMessage(
-      chatId,
-      `🆘 Для обращения используйте:
-
-<code>/support текст обращения</code>`,
-      env
-    );
-
-    return;
-  }
-
-  const result =
-    await dbRun(
-      env,
-      `INSERT INTO support_tickets
-       (
-         player_telegram_id,
-         subject,
-         status,
-         created_at
-       )
-       VALUES
-       (?, ?, 'open', CURRENT_TIMESTAMP)`,
-      telegramId,
-      text.slice(0, 200)
-    );
-
-  const ticketId =
-    result.meta?.last_row_id;
-
-  if (ticketId) {
-    await dbRun(
-      env,
-      `INSERT INTO support_messages
-       (
-         ticket_id,
-         sender_telegram_id,
-         sender_role,
-         message,
-         created_at
-       )
-       VALUES
-       (?, ?, 'player', ?, CURRENT_TIMESTAMP)`,
-      ticketId,
-      telegramId,
-      text.slice(
-        0,
-        CONFIG.maxMessageLength
-      )
-    );
-  }
-
-  await sendMessage(
-    chatId,
-    `✅ Обращение создано.
-
-Номер тикета:
-<b>#${ticketId || "—"}</b>`,
-    env
-  );
-}
-
-async function showTicket(
-  chatId,
-  employee,
-  ticketId,
-  env
-) {
-  if (!employee) {
-    return;
-  }
-
-  const ticket =
-    await dbGet(
-      env,
-      `SELECT *
-       FROM support_tickets
-       WHERE id = ?
-       LIMIT 1`,
-      ticketId
-    );
-
-  if (!ticket) {
-    await sendMessage(
-      chatId,
-      "❌ Тикет не найден.",
-      env
-    );
-
-    return;
-  }
-
-  const messages =
-    await dbAll(
-      env,
-      `SELECT *
-       FROM support_messages
-       WHERE ticket_id = ?
-       ORDER BY id ASC
-       LIMIT 50`,
-      ticketId
-    );
-
-  let text =
-    `<b>🎫 ТИКЕТ #${ticket.id}</b>
-
-Игрок:
-<code>${escapeHtml(
-      ticket.player_telegram_id
-    )}</code>
-
-Статус:
-<b>${escapeHtml(
-      ticket.status
-    )}</b>
-
-`;
-
-  for (const row of messages) {
-    text +=
-      `<b>${escapeHtml(
-        row.sender_role
-      )}</b>: ${escapeHtml(
-        row.message
-      )}\n\n`;
-  }
-
-  await sendMessage(
-    chatId,
-    text,
-    env
-  );
-}
-
-/* ============================================================
-   WHEEL SETTINGS
-   ============================================================ */
-
-async function getWheelSettings(
-  env
-) {
-  return dbGet(
-    env,
-    `SELECT *
-     FROM wheel_settings
-     ORDER BY id
-     LIMIT 1`
-  );
-}
-
-async function showWheelMenu(
-  chatId,
-  employee,
-  env
-) {
-  const settings =
-    await getWheelSettings(
-      env
-    );
-
-  const cost =
-    settings
-      ? Number(settings.spin_cost || 0)
-      : 0;
-
-  const enabled =
-    settings
-      ? Number(settings.enabled || 0)
-      : 0;
-
-  await sendMessage(
-    chatId,
-    `<b>🎡 КОЛЕСО</b>
-
-Цена:
-<b>${formatMoney(
-      cost
-    )} ₽</b>
-
-Статус:
-<b>${enabled
-      ? "ВКЛЮЧЕНО"
-      : "ВЫКЛЮЧЕНО"}</b>`,
-    env,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "💰 ЦЕНА",
-              callback_data:
-                "wheel_price"
-            }
-          ],
-          [
-            {
-              text: "✅ ВКЛ",
-              callback_data:
-                "wheel_enable"
-            },
-            {
-              text: "⛔ ВЫКЛ",
-              callback_data:
-                "wheel_disable"
-            }
-          ],
-          [
-            {
-              text: "🎁 ПРИЗЫ",
-              callback_data:
-                "wheel_prizes"
-            },
-            {
-              text: "📜 ИСТОРИЯ",
-              callback_data:
-                "wheel_history"
-            }
-          ]
-        ]
-      }
-    }
-  );
-}
-
-async function setWheelEnabled(
-  env,
-  employee,
-  chatId,
-  enabled
-) {
-  if (!hasRank(employee, 5)) {
-    await sendMessage(
-      chatId,
-      "❌ Требуется 5+ ранг.",
-      env
-    );
-
-    return;
-  }
-
-  const settings =
-    await getWheelSettings(
-      env
-    );
-
-  if (!settings) {
-    await sendMessage(
-      chatId,
-      "❌ Таблица wheel_settings пуста.",
-      env
-    );
-
-    return;
-  }
-
-  await dbRun(
-    env,
-    `UPDATE wheel_settings
-     SET enabled = ?,
-         updated_by = ?,
-         updated_at = CURRENT_TIMESTAMP
-     WHERE id = ?`,
-    enabled ? 1 : 0,
-    String(employee.telegram_id),
-    settings.id
-  );
-
-  await registerAdminAction(
-    env,
-    employee,
-    enabled
-      ? "wheel_enable"
-      : "wheel_disable",
-    null,
-    0,
-    enabled
-      ? "Колесо включено"
-      : "Колесо выключено"
-  );
-
-  await sendMessage(
-    chatId,
-    enabled
-      ? "✅ Колесо включено."
-      : "⛔ Колесо выключено.",
-    env
-  );
-}
-
-/* ============================================================
-   WHEEL PRIZES
-   ============================================================ */
-
-async function showWheelPrizes(
-  chatId,
-  env
-) {
-  const rows =
-    await dbAll(
-      env,
-      `SELECT *
-       FROM wheel_prizes
-       WHERE enabled = 1
-       ORDER BY sort_order ASC, id ASC
-       LIMIT 100`
-    );
-
-  let text =
-    "<b>🎁 ПРИЗЫ КОЛЕСА</b>\n\n";
-
-  if (!rows.length) {
-    text += "Призы отсутствуют.";
-  }
-
-  for (const row of rows) {
-    text +=
-      `#${row.id} — ` +
-      `${escapeHtml(
-        row.name
-      )}\n` +
-      `Тип: ${escapeHtml(
-        row.prize_type
-      )}\n` +
-      `Значение: <b>${Number(
-        row.prize_value || 0
-      )}</b>\n` +
-      `Шанс: <b>${Number(
-        row.probability || 0
-      )}%</b>\n\n`;
-  }
-
-  await sendMessage(
-    chatId,
-    text,
-    env
-  );
-}
-
-/* ============================================================
-   WHEEL HISTORY
-   ============================================================ */
-
-async function showWheelHistory(
-  chatId,
-  employee,
-  env
-) {
-  const rows =
-    await dbAll(
-      env,
-      `SELECT *
-       FROM spin_history
-       ORDER BY id DESC
-       LIMIT 30`
-    );
-
-  let text =
-    "<b>📜 ИСТОРИЯ КОЛЕСА</b>\n\n";
-
-  if (!rows.length) {
-    text += "История пуста.";
-  }
-
-  for (const row of rows) {
-    text +=
-      `${formatTime(
-        row.created_at
-      )} — ` +
-      `<code>${escapeHtml(
-        row.telegram_id
-      )}</code>\n` +
-      `${escapeHtml(
-        row.prize_name || "Приз"
-      )} — ` +
-      `<b>${Number(
-        row.prize_value || 0
-      )}</b>\n\n`;
-  }
-
-  await sendMessage(
-    chatId,
-    text,
-    env
-  );
-}
-
-/* ============================================================
-   SPIN
-   ============================================================ */
-
-async function cmdSpin(
-  chatId,
-  telegramId,
-  env
-) {
-  const user =
-    await getUser(
-      env,
-      telegramId
-    );
-
-  if (!user) {
-    return;
-  }
-
-  const settings =
-    await getWheelSettings(
-      env
-    );
-
-  if (
-    !settings ||
-    Number(settings.enabled) !== 1
-  ) {
-    await sendMessage(
-      chatId,
-      "⛔ Колесо сейчас отключено.",
-      env
-    );
-
-    return;
-  }
-
-  const cost =
-    Number(settings.spin_cost || 0);
-
-  if (
-    Number(user.balance || 0) <
-    cost
-  ) {
-    await sendMessage(
-      chatId,
-      `❌ Недостаточно средств.
-
-Цена вращения:
-<b>${formatMoney(
-        cost
-      )} ₽</b>`,
-      env
-    );
-
-    return;
-  }
-
-  const prizes =
-    await dbAll(
-      env,
-      `SELECT *
-       FROM wheel_prizes
-       WHERE enabled = 1
-       ORDER BY sort_order ASC, id ASC`
-    );
-
-  if (!prizes.length) {
-    await sendMessage(
-      chatId,
-      "❌ В колесе нет активных призов.",
-      env
-    );
-
-    return;
-  }
-
-  const prize =
-    weightedPrize(
-      prizes
-    );
-
-  if (!prize) {
-    await sendMessage(
-      chatId,
-      "❌ Не удалось определить приз.",
-      env
-    );
-
-    return;
-  }
-
-  const oldBalance =
-    Number(user.balance || 0);
-
-  const newBalance =
-    oldBalance - cost;
-
-  await dbRun(
-    env,
-    `UPDATE users
-     SET balance = ?,
-         updated_at = CURRENT_TIMESTAMP
-     WHERE telegram_id = ?`,
-    newBalance,
-    telegramId
-  );
-
-  await dbRun(
-    env,
-    `INSERT INTO spin_history
-     (
-       telegram_id,
-       prize_id,
-       prize_name,
-       prize_type,
-       prize_value,
-       cost,
-       created_at
-     )
-     VALUES
-     (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-    telegramId,
-    prize.id,
-    prize.name,
-    prize.prize_type,
-    Number(prize.prize_value || 0),
-    cost
-  );
-
-  await dbRun(
-    env,
-    `INSERT INTO spins
-     (
-       telegram_id,
-       spin_number,
-       prize_uc,
-       prize_balance,
-       created_at
-     )
-     VALUES
-     (
-       ?,
-       COALESCE(
-         (
-           SELECT MAX(spin_number) + 1
-           FROM spins
-           WHERE telegram_id = ?
-         ),
-         1
-       ),
-       ?,
-       ?,
-       CURRENT_TIMESTAMP
-     )`,
-    telegramId,
-    telegramId,
-    prize.prize_type === "uc"
-      ? Number(prize.prize_value || 0)
-      : 0,
-    prize.prize_type === "balance"
-      ? Number(prize.prize_value || 0)
-      : 0
-  );
-
-  let rewardText =
-    escapeHtml(
-      prize.name
-    );
-
-  if (
-    prize.prize_type ===
-    "uc"
-  ) {
-    await dbRun(
-      env,
-      `UPDATE users
-       SET uc = uc + ?,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE telegram_id = ?`,
-      Number(prize.prize_value || 0),
-      telegramId
-    );
-
-    rewardText +=
-      ` — +${Number(
-        prize.prize_value || 0
-      )} UC`;
-  }
-
-  if (
-    prize.prize_type ===
-    "balance"
-  ) {
-    await dbRun(
-      env,
-      `UPDATE users
-       SET balance = balance + ?,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE telegram_id = ?`,
-      Number(prize.prize_value || 0),
-      telegramId
-    );
-
-    rewardText +=
-      ` — +${formatMoney(
-        prize.prize_value
-      )} ₽`;
-  }
-
-  await sendMessage(
-    chatId,
-    `<b>🎡 ВРАЩЕНИЕ</b>
-
-🎁 Ваш приз:
-<b>${rewardText}</b>
-
-💰 Списано:
-<b>${formatMoney(
-      cost
-    )} ₽</b>`,
-    env
-  );
-}
-
-function weightedPrize(
-  prizes
-) {
-  const valid =
-    prizes.filter(
-      row =>
-        Number(row.probability) > 0
-    );
-
-  if (!valid.length) {
-    return prizes[0] || null;
-  }
-
-  const total =
-    valid.reduce(
-      (sum, row) =>
-        sum +
-        Number(row.probability),
-      0
-    );
-
-  let random =
-    Math.random() * total;
-
-  for (const prize of valid) {
-    random -=
-      Number(prize.probability);
-
-    if (random <= 0) {
-      return prize;
-    }
-  }
-
-  return valid[
-    valid.length - 1
-  ];
-}
-
-/* ============================================================
-   DAILY
-   ============================================================ */
-
-async function cmdDaily(
-  chatId,
-  telegramId,
-  env
-) {
-  const today =
-    getMoscowDate();
-
-  const key =
-    `daily_bonus_${telegramId}`;
-
-  const existing =
-    await dbGet(
-      env,
-      `SELECT value
-       FROM system_settings
-       WHERE key = ?`,
-      key
-    );
-
-  if (
-    existing?.value === today
-  ) {
-    await sendMessage(
-      chatId,
-      "❌ Ежедневный бонус уже получен сегодня.",
-      env
-    );
-
-    return;
-  }
-
-  const reward = 1;
-
-  await dbRun(
-    env,
-    `UPDATE users
-     SET uc = uc + ?,
-         updated_at = CURRENT_TIMESTAMP
-     WHERE telegram_id = ?`,
-    reward,
-    telegramId
-  );
-
-  await dbRun(
-    env,
-    `INSERT INTO system_settings
-     (key, value, updated_by, updated_at)
-     VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-     ON CONFLICT(key)
-     DO UPDATE SET
-       value = excluded.value,
-       updated_by = excluded.updated_by,
-       updated_at = excluded.updated_at`,
-    key,
-    today,
-    telegramId
-  );
-
-  await sendMessage(
-    chatId,
-    `🎁 Ежедневный бонус получен!
-
-💎 Начислено:
-<b>+${reward} UC</b>`,
-    env
-  );
-}
-
-/* ============================================================
-   PROMO
-   ============================================================ */
-
-async function cmdPromo(
-  chatId,
-  telegramId,
-  args,
-  env
-) {
-  /*
-   * В текущей базе нет таблиц promo_codes/promo_uses.
-   * Поэтому команда специально не делает запрос
-   * к несуществующим таблицам.
-   */
-
-  await sendMessage(
-    chatId,
-    "ℹ️ Система промокодов пока не подключена к текущей схеме D1.",
-    env
-  );
-}
-
-/* ============================================================
-   FINANCE MENU
-   ============================================================ */
-
-async function showFinanceMenu(
-  chatId,
-  employee,
-  env
-) {
-  await sendMessage(
-    chatId,
-    `<b>💰 ФИНАНСЫ</b>
-
-Управление балансом и UC доступно администраторам 5+ ранга.`,
-    env
-  );
-}
-
-/* ============================================================
-   ACTIVITY
-   ============================================================ */
-
-async function showActivity(
-  chatId,
-  employee,
-  env
-) {
-  const since =
-    `${getMoscowDate()} 00:00:00`;
-
-  const actions =
-    await dbGet(
-      env,
-      `SELECT COUNT(*) AS count
-       FROM admin_actions
-       WHERE admin_telegram_id = ?
-       AND created_at >= ?`,
-      String(employee.telegram_id),
-      since
-    );
-
-  const count =
-    Number(actions?.count || 0);
-
-  const minutes =
-    Math.floor(
-      count * 5
-    );
-
-  const points =
-    count *
-    CONFIG.pointsPerAction;
-
-  await sendMessage(
-    chatId,
-    `<b>📊 МОЯ АКТИВНОСТЬ</b>
-
-Действий сегодня:
-<b>${count}</b>
-
-Расчётная активность:
-<b>${formatMinutes(
-      minutes
-    )}</b>
-
-Баллов:
-<b>${points}</b>
-
-Требование:
-<b>${formatMinutes(
-      CONFIG.requiredActivityMinutes
-    )}</b>`,
     env
   );
 }
@@ -3638,11 +1728,11 @@ async function cmdRank(
 
   if (
     !employee ||
-    !hasRank(employee, 5)
+    !isAdminRank(employee.rank)
   ) {
     await sendMessage(
       chatId,
-      "❌ Недостаточно прав.",
+      "❌ Доступ запрещён.",
       env
     );
 
@@ -3652,14 +1742,14 @@ async function cmdRank(
   if (args.length < 2) {
     await sendMessage(
       chatId,
-      "Формат:\n<code>/rank TelegramID Ранг</code>",
+      "❌ Формат:\n<code>/rank TelegramID Ранг</code>",
       env
     );
 
     return;
   }
 
-  const targetId =
+  const targetTelegramId =
     String(args[0]);
 
   const newRank =
@@ -3668,11 +1758,24 @@ async function cmdRank(
   if (
     !Number.isInteger(newRank) ||
     newRank < 0 ||
-    newRank > Number(employee.rank)
+    newRank > 6
   ) {
     await sendMessage(
       chatId,
-      "❌ Некорректный ранг.",
+      "❌ Ранг должен быть от 0 до 6.",
+      env
+    );
+
+    return;
+  }
+
+  if (
+    newRank >= Number(employee.rank) &&
+    Number(employee.rank) !== 6
+  ) {
+    await sendMessage(
+      chatId,
+      "❌ Нельзя выдать ранг равный или выше своего.",
       env
     );
 
@@ -3680,9 +1783,9 @@ async function cmdRank(
   }
 
   const target =
-    await getUser(
+    await getUserByTelegramId(
       env,
-      targetId
+      targetTelegramId
     );
 
   if (!target) {
@@ -3695,71 +1798,63 @@ async function cmdRank(
     return;
   }
 
-  nst oldRank =
-    Number(target.rank || 0);
+  const oldRank =
+    Number(target.rank);
 
   await dbRun(
     env,
     `UPDATE users
      SET rank = ?,
          role = CASE
-           WHEN ? > 0 THEN 'admin'
-           ELSE 'player'
+           WHEN ? = 0 THEN 'player'
+           ELSE 'admin'
          END,
-         updated_at = CURRENT_TIMESTAMP
+         updated_at = datetime('now')
      WHERE telegram_id = ?`,
     newRank,
     newRank,
-    targetId
+    targetTelegramId
   );
 
-  if (newRank > 0) {
-    await dbRun(
-      env,
-      `INSERT OR REPLACE INTO admin_roles
-       (
-         telegram_id,
-         role,
-         granted_by,
-         created_at
-       )
-       VALUES
-       (?, 'admin', ?, CURRENT_TIMESTAMP)`,
-      targetId,
-      telegramId
-    );
-  } else {
-    await dbRun(
-      env,
-      `DELETE FROM admin_roles
-       WHERE telegram_id = ?`,
-      targetId
-    );
-  }
+  await dbRun(
+    env,
+    `INSERT INTO role_change_requests
+     (
+       target_telegram_id,
+       requested_role,
+       requested_rank,
+       requested_by,
+       reason,
+       status,
+       reviewed_by,
+       reviewed_at,
+       created_at
+     )
+     VALUES (?, ?, ?, ?, ?, 'approved', ?, datetime('now'), datetime('now'))`,
+    targetTelegramId,
+    newRank === 0
+      ? "player"
+      : "admin",
+    newRank,
+    telegramId,
+    `Изменение ранга ${oldRank} -> ${newRank}`,
+    telegramId
+  );
 
   await registerAdminAction(
     env,
     employee,
     "rank_change",
-    targetId,
-    newRank,
-    `old_rank=${oldRank}; new_rank=${newRank}`
+    targetTelegramId,
+    0,
+    `${oldRank} -> ${newRank}`
   );
 
   await sendMessage(
     chatId,
-    `✅ Ранг изменён.
-
-Игрок:
-<code>${escapeHtml(
-      targetId
-    )}</code>
-
-Было:
-<b>${oldRank}</b>
-
-Стало:
-<b>${newRank}</b>`,
+    `✅ Ранг пользователя <code>${escapeHtml(
+      targetTelegramId
+    )}</code> изменён: <b>${newRank}</b>.`,
     env
   );
 }
@@ -3782,11 +1877,11 @@ async function cmdUnrank(
 
   if (
     !employee ||
-    !hasRank(employee, 5)
+    Number(employee.rank) < 5
   ) {
     await sendMessage(
       chatId,
-      "❌ Недостаточно прав.",
+      "❌ Для снятия ранга требуется 5+ ранг.",
       env
     );
 
@@ -3796,20 +1891,20 @@ async function cmdUnrank(
   if (!args[0]) {
     await sendMessage(
       chatId,
-      "Формат:\n<code>/unrank TelegramID</code>",
+      "❌ Формат:\n<code>/unrank TelegramID</code>",
       env
     );
 
     return;
   }
 
-  const targetId =
+  const targetTelegramId =
     String(args[0]);
 
   const target =
-    await getUser(
+    await getUserByTelegramId(
       env,
-      targetId
+      targetTelegramId
     );
 
   if (!target) {
@@ -3823,224 +1918,3301 @@ async function cmdUnrank(
   }
 
   const oldRank =
-    Number(target.rank || 0);
+    Number(target.rank);
 
-  await dbRun(
-    env,
-    `UPDATE users
-     SET rank = 0,
-         role = 'player',
-         updated_at = CURRENT_TIMESTAMP
-     WHERE telegram_id = ?`,
-    targetId
-  );
-
-  await dbRun(
-    env,
-    `DELETE FROM admin_roles
-     WHERE telegram_id = ?`,
-    targetId
-  );
-
-  await registerAdminAction(
-    env,
-    employee,
-    "rank_remove",
-    targetId,
-    oldRank,
-    `old_rank=${oldRank}; new_rank=0`
-  );
-
-  await sendMessage(
-    chatId,
-    `✅ Административный ранг снят.
-
-Игрок:
-<code>${escapeHtml(
-      targetId
-    )}</code>`,
-    env
-  );
-}
-
-/* ============================================================
-   GLOBAL CHAT
-   ============================================================ */
-
-async function handleGlobalChat(
-  message,
-  env
-) {
-  const telegramId =
-    String(message.from.id);
-
-  const text =
-    String(message.text || "")
-      .trim();
-
-  if (!text) {
-    return;
-  }
-
-  /*
-   * Проверка активного обычного бана.
-   */
-  const ban =
-    await dbGet(
-      env,
-      `SELECT *
-       FROM bans
-       WHERE telegram_id = ?
-       AND (
-         expires_at IS NULL
-         OR expires_at > CURRENT_TIMESTAMP
-       )
-       LIMIT 1`,
-      telegramId
-    );
-
-  if (ban) {
+  if (
+    oldRank >=
+    Number(employee.rank) &&
+    Number(employee.rank) !== 6
+  ) {
     await sendMessage(
-      message.chat.id,
-      `🚫 Вы заблокированы.
-
-Причина:
-${escapeHtml(
-        ban.reason || "Не указана"
-      )}`,
+      chatId,
+      "❌ Нельзя снять ранг с сотрудника равного или выше себя.",
       env
     );
 
     return;
   }
 
-  /*
-   * Проверка silent ban.
-   */
-  const silent =
-    await dbGet(
-      env,
-      `SELECT *
-       FROM silent_bans
-       WHERE telegram_id = ?
-       AND active = 1
-       AND (
-         expires_at IS NULL
-         OR expires_at > CURRENT_TIMESTAMP
-       )
-       LIMIT 1`,
-      telegramId
-    );
-
-  if (silent) {
-    return;
-  }
-
-  /*
-   * Здесь сообщение сохраняется в чат.
-   * Рассылка всем пользователям намеренно
-   * не выполняется автоматически.
-   */
   await dbRun(
     env,
-    `INSERT INTO wheel_chat_messages
+    `UPDATE users
+     SET rank = 0,
+         role = 'player',
+         panel_session = 0,
+         panel_status = 'offline',
+         updated_at = datetime('now')
+     WHERE telegram_id = ?`,
+    targetTelegramId
+  );
+
+  await registerAdminAction(
+    env,
+    employee,
+    "unrank",
+    targetTelegramId,
+    0,
+    `Снят ранг ${oldRank}`
+  );
+
+  await sendMessage(
+    chatId,
+    `✅ Ранг пользователя <code>${escapeHtml(
+      targetTelegramId
+    )}</code> снят.`,
+    env
+  );
+}
+/* ============================================================
+   DOXACHKAA UC — worker.js
+   ЧАСТЬ 3/5
+   PANEL + ADMIN ACTIONS + WHEEL
+   ============================================================ */
+
+/* ============================================================
+   ADMIN ACTION LOG
+   ============================================================ */
+
+async function logAdminAction(
+  env,
+  adminTelegramId,
+  action,
+  targetTelegramId = null,
+  amount = 0,
+  details = null
+) {
+  await dbRun(
+    env,
+    `INSERT INTO admin_actions
      (
-       telegram_id,
-       username,
-       role_key,
-       message,
-       deleted,
-       created_at
+       admin_telegram_id,
+       action,
+       target_telegram_id,
+       amount,
+       details
      )
-     VALUES
-     (?, ?, ?, ?, 0, CURRENT_TIMESTAMP)`,
-    telegramId,
-    message.from.username || "",
-    "player",
-    text.slice(
-      0,
-      CONFIG.maxMessageLength
-    )
+     VALUES (?, ?, ?, ?, ?)`,
+    String(adminTelegramId),
+    action,
+    targetTelegramId !== null
+      ? String(targetTelegramId)
+      : null,
+    Number(amount || 0),
+    details
   );
 }
 
 /* ============================================================
-   HELPERS
+   BALANCE AUDIT
    ============================================================ */
 
-function formatMoney(
+async function changeUserBalance(
+  env,
+  adminTelegramId,
+  targetTelegramId,
+  amount,
+  reason
+) {
+  const target = await dbGet(
+    env,
+    `SELECT *
+     FROM users
+     WHERE telegram_id = ?
+     LIMIT 1`,
+    String(targetTelegramId)
+  );
+
+  if (!target) {
+    return {
+      ok: false,
+      message: "❌ Пользователь не найден."
+    };
+  }
+
+  const value = Number(amount);
+
+  if (!Number.isFinite(value) || value === 0) {
+    return {
+      ok: false,
+      message: "❌ Некорректная сумма."
+    };
+  }
+
+  const oldBalance =
+    Number(target.balance || 0);
+
+  const newBalance =
+    oldBalance + value;
+
+  if (newBalance < 0) {
+    return {
+      ok: false,
+      message:
+        "❌ Баланс не может быть отрицательным."
+    };
+  }
+
+  await dbRun(
+    env,
+    `UPDATE users
+     SET balance = ?,
+         updated_at = datetime('now')
+     WHERE telegram_id = ?`,
+    newBalance,
+    String(targetTelegramId)
+  );
+
+  await dbRun(
+    env,
+    `INSERT INTO balance_audit
+     (
+       actor_telegram_id,
+       target_telegram_id,
+       old_balance,
+       new_balance,
+       amount,
+       reason,
+       reference_type,
+       reference_id
+     )
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    String(adminTelegramId),
+    String(targetTelegramId),
+    oldBalance,
+    newBalance,
+    value,
+    reason || "manual",
+    "admin",
+    null
+  );
+
+  await dbRun(
+    env,
+    `INSERT INTO transactions
+     (
+       telegram_id,
+       type,
+       amount,
+       description
+     )
+     VALUES (?, ?, ?, ?)`,
+    String(targetTelegramId),
+    value > 0
+      ? "admin_balance_add"
+      : "admin_balance_remove",
+    value,
+    reason || "Изменение баланса администратором"
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    value > 0
+      ? "balance_add"
+      : "balance_remove",
+    targetTelegramId,
+    value,
+    reason || null
+  );
+
+  return {
+    ok: true,
+    oldBalance,
+    newBalance,
+    amount: value
+  };
+}
+
+/* ============================================================
+   UC AUDIT
+   ============================================================ */
+
+async function changeUserUC(
+  env,
+  adminTelegramId,
+  targetTelegramId,
+  amount,
+  reason
+) {
+  const target = await dbGet(
+    env,
+    `SELECT *
+     FROM users
+     WHERE telegram_id = ?
+     LIMIT 1`,
+    String(targetTelegramId)
+  );
+
+  if (!target) {
+    return {
+      ok: false,
+      message: "❌ Пользователь не найден."
+    };
+  }
+
+  const value = Number(amount);
+
+  if (!Number.isInteger(value) || value === 0) {
+    return {
+      ok: false,
+      message:
+        "❌ Количество UC должно быть целым числом."
+    };
+  }
+
+  const oldUC =
+    Number(target.uc || 0);
+
+  const newUC =
+    oldUC + value;
+
+  if (newUC < 0) {
+    return {
+      ok: false,
+      message:
+        "❌ Количество UC не может быть отрицательным."
+    };
+  }
+
+  await dbRun(
+    env,
+    `UPDATE users
+     SET uc = ?,
+         updated_at = datetime('now')
+     WHERE telegram_id = ?`,
+    newUC,
+    String(targetTelegramId)
+  );
+
+  await dbRun(
+    env,
+    `INSERT INTO uc_audit
+     (
+       actor_telegram_id,
+       target_telegram_id,
+       old_uc,
+       new_uc,
+       amount,
+       reason
+     )
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    String(adminTelegramId),
+    String(targetTelegramId),
+    oldUC,
+    newUC,
+    value,
+    reason || "manual"
+  );
+
+  await dbRun(
+    env,
+    `INSERT INTO transactions
+     (
+       telegram_id,
+       type,
+       amount,
+       description
+     )
+     VALUES (?, ?, ?, ?)`,
+    String(targetTelegramId),
+    value > 0
+      ? "admin_uc_add"
+      : "admin_uc_remove",
+    value,
+    reason || "Изменение UC администратором"
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    value > 0
+      ? "uc_add"
+      : "uc_remove",
+    targetTelegramId,
+    value,
+    reason || null
+  );
+
+  return {
+    ok: true,
+    oldUC,
+    newUC,
+    amount: value
+  };
+}
+
+/* ============================================================
+   USER CARD
+   ============================================================ */
+
+async function getUserCard(
+  env,
+  telegramId
+) {
+  const user = await dbGet(
+    env,
+    `SELECT *
+     FROM users
+     WHERE telegram_id = ?
+     LIMIT 1`,
+    String(telegramId)
+  );
+
+  if (!user) {
+    return null;
+  }
+
+  const transactions =
+    await dbAll(
+      env,
+      `SELECT *
+       FROM transactions
+       WHERE telegram_id = ?
+       ORDER BY id DESC
+       LIMIT 20`,
+      String(telegramId)
+    );
+
+  const balanceAudit =
+    await dbAll(
+      env,
+      `SELECT *
+       FROM balance_audit
+       WHERE target_telegram_id = ?
+       ORDER BY id DESC
+       LIMIT 20`,
+      String(telegramId)
+    );
+
+  const ucAudit =
+    await dbAll(
+      env,
+      `SELECT *
+       FROM uc_audit
+       WHERE target_telegram_id = ?
+       ORDER BY id DESC
+       LIMIT 20`,
+      String(telegramId)
+    );
+
+  const bans =
+    await dbAll(
+      env,
+      `SELECT *
+       FROM bans
+       WHERE telegram_id = ?
+       ORDER BY created_at DESC`,
+      String(telegramId)
+    );
+
+  const silentBans =
+    await dbAll(
+      env,
+      `SELECT *
+       FROM silent_bans
+       WHERE telegram_id = ?
+       ORDER BY id DESC`,
+      String(telegramId)
+    );
+
+  const spins =
+    await dbAll(
+      env,
+      `SELECT *
+       FROM spin_history
+       WHERE telegram_id = ?
+       ORDER BY id DESC
+       LIMIT 20`,
+      String(telegramId)
+    );
+
+  return {
+    user,
+    transactions,
+    balanceAudit,
+    ucAudit,
+    bans,
+    silentBans,
+    spins
+  };
+}
+
+/* ============================================================
+   SEARCH USER
+   ============================================================ */
+
+async function searchUser(
+  env,
+  query
+) {
+  const value =
+    String(query || "").trim();
+
+  if (!value) {
+    return [];
+  }
+
+  return dbAll(
+    env,
+    `SELECT
+       id,
+       telegram_id,
+       username,
+       first_name,
+       last_name,
+       role,
+       rank,
+       balance,
+       uc,
+       created_at,
+       updated_at,
+       panel_status
+     FROM users
+     WHERE telegram_id = ?
+        OR username LIKE ?
+        OR first_name LIKE ?
+        OR last_name LIKE ?
+        OR id = ?
+     ORDER BY id DESC
+     LIMIT 20`,
+    value,
+    `%${value}%`,
+    `%${value}%`,
+    `%${value}%`,
+    value
+  );
+}
+
+/* ============================================================
+   BAN USER
+   ============================================================ */
+
+async function banUser(
+  env,
+  adminTelegramId,
+  targetTelegramId,
+  reason,
+  expiresAt = null
+) {
+  if (!reason) {
+    return {
+      ok: false,
+      message: "❌ Укажите причину блокировки."
+    };
+  }
+
+  const target = await dbGet(
+    env,
+    `SELECT telegram_id
+     FROM users
+     WHERE telegram_id = ?
+     LIMIT 1`,
+    String(targetTelegramId)
+  );
+
+  if (!target) {
+    return {
+      ok: false,
+      message: "❌ Пользователь не найден."
+    };
+  }
+
+  await dbRun(
+    env,
+    `INSERT OR REPLACE INTO bans
+     (
+       telegram_id,
+       reason,
+       banned_by,
+       expires_at
+     )
+     VALUES (?, ?, ?, ?)`,
+    String(targetTelegramId),
+    reason,
+    String(adminTelegramId),
+    expiresAt
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    "ban",
+    targetTelegramId,
+    0,
+    reason
+  );
+
+  return {
+    ok: true
+  };
+}
+
+/* ============================================================
+   SILENT BAN
+   ============================================================ */
+
+async function silentBanUser(
+  env,
+  adminTelegramId,
+  targetTelegramId,
+  reason,
+  expiresAt = null
+) {
+  if (!reason) {
+    return {
+      ok: false,
+      message: "❌ Укажите причину."
+    };
+  }
+
+  const target = await dbGet(
+    env,
+    `SELECT telegram_id
+     FROM users
+     WHERE telegram_id = ?
+     LIMIT 1`,
+    String(targetTelegramId)
+  );
+
+  if (!target) {
+    return {
+      ok: false,
+      message: "❌ Пользователь не найден."
+    };
+  }
+
+  await dbRun(
+    env,
+    `INSERT INTO silent_bans
+     (
+       telegram_id,
+       banned_by,
+       reason,
+       expires_at,
+       active
+     )
+     VALUES (?, ?, ?, ?, 1)`,
+    String(targetTelegramId),
+    String(adminTelegramId),
+    reason,
+    expiresAt
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    "silent_ban",
+    targetTelegramId,
+    0,
+    reason
+  );
+
+  return {
+    ok: true
+  };
+}
+
+/* ============================================================
+   UNBAN
+   ============================================================ */
+
+async function unbanUser(
+  env,
+  adminTelegramId,
+  targetTelegramId
+) {
+  await dbRun(
+    env,
+    `DELETE FROM bans
+     WHERE telegram_id = ?`,
+    String(targetTelegramId)
+  );
+
+  await dbRun(
+    env,
+    `UPDATE silent_bans
+     SET active = 0
+     WHERE telegram_id = ?
+     AND active = 1`,
+    String(targetTelegramId)
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    "unban",
+    targetTelegramId
+  );
+
+  return {
+    ok: true
+  };
+}
+
+/* ============================================================
+   WHEEL SETTINGS
+   ============================================================ */
+
+async function getWheelSettings(env) {
+  const row = await dbGet(
+    env,
+    `SELECT *
+     FROM wheel_settings
+     ORDER BY id ASC
+     LIMIT 1`
+  );
+
+  if (row) {
+    return row;
+  }
+
+  await dbRun(
+    env,
+    `INSERT INTO wheel_settings
+     (
+       spin_cost,
+       currency,
+       enabled
+     )
+     VALUES (0, 'RUB', 1)`
+  );
+
+  return dbGet(
+    env,
+    `SELECT *
+     FROM wheel_settings
+     ORDER BY id DESC
+     LIMIT 1`
+  );
+}
+
+/* ============================================================
+   SET WHEEL PRICE
+   ============================================================ */
+
+async function setWheelPrice(
+  env,
+  adminTelegramId,
+  price
+) {
+  const value = Number(price);
+
+  if (
+    !Number.isFinite(value) ||
+    value < 0
+  ) {
+    return {
+      ok: false,
+      message: "❌ Некорректная цена."
+    };
+  }
+
+  const settings =
+    await getWheelSettings(env);
+
+  await dbRun(
+    env,
+    `UPDATE wheel_settings
+     SET spin_cost = ?,
+         updated_by = ?,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    value,
+    String(adminTelegramId),
+    settings.id
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    "wheel_price",
+    null,
+    value,
+    "Изменена цена вращения"
+  );
+
+  return {
+    ok: true,
+    price: value
+  };
+}
+
+/* ============================================================
+   ENABLE / DISABLE WHEEL
+   ============================================================ */
+
+async function setWheelEnabled(
+  env,
+  adminTelegramId,
+  enabled
+) {
+  const settings =
+    await getWheelSettings(env);
+
+  const value =
+    enabled ? 1 : 0;
+
+  await dbRun(
+    env,
+    `UPDATE wheel_settings
+     SET enabled = ?,
+         updated_by = ?,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    value,
+    String(adminTelegramId),
+    settings.id
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    value
+      ? "wheel_enable"
+      : "wheel_disable"
+  );
+
+  return {
+    ok: true,
+    enabled: value
+  };
+}
+
+/* ============================================================
+   WHEEL PRIZES
+   ============================================================ */
+
+async function getWheelPrizes(env) {
+  return dbAll(
+    env,
+    `SELECT *
+     FROM wheel_prizes
+     WHERE enabled = 1
+     ORDER BY sort_order ASC, id ASC`
+  );
+}
+
+/* ============================================================
+   UPDATE PRIZE
+   ============================================================ */
+
+async function updateWheelPrize(
+  env,
+  adminTelegramId,
+  prizeId,
+  name,
+  prizeType,
+  prizeValue,
+  probability
+) {
+  const id =
+    Number(prizeId);
+
+  const value =
+    Number(prizeValue);
+
+  const chance =
+    Number(probability);
+
+  if (!Number.isInteger(id)) {
+    return {
+      ok: false,
+      message: "❌ Некорректный ID награды."
+    };
+  }
+
+  if (!name) {
+    return {
+      ok: false,
+      message: "❌ Название награды пустое."
+    };
+  }
+
+  if (!Number.isFinite(value) || value < 0) {
+    return {
+      ok: false,
+      message: "❌ Некорректное значение награды."
+    };
+  }
+
+  if (
+    !Number.isFinite(chance) ||
+    chance < 0 ||
+    chance > 100
+  ) {
+    return {
+      ok: false,
+      message:
+        "❌ Вероятность должна быть от 0 до 100."
+    };
+  }
+
+  const prize =
+    await dbGet(
+      env,
+      `SELECT id
+       FROM wheel_prizes
+       WHERE id = ?`,
+      id
+    );
+
+  if (!prize) {
+    return {
+      ok: false,
+      message: "❌ Награда не найдена."
+    };
+  }
+
+  await dbRun(
+    env,
+    `UPDATE wheel_prizes
+     SET name = ?,
+         prize_type = ?,
+         prize_value = ?,
+         probability = ?,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    name,
+    prizeType || "uc",
+    value,
+    chance,
+    id
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    "wheel_prize_update",
+    null,
+    value,
+    `prize_id=${id}; probability=${chance}`
+  );
+
+  return {
+    ok: true
+  };
+}
+
+/* ============================================================
+   ADD WHEEL PRIZE
+   ============================================================ */
+
+async function addWheelPrize(
+  env,
+  adminTelegramId,
+  name,
+  prizeType,
+  prizeValue,
+  probability
+) {
+  const value =
+    Number(prizeValue);
+
+  const chance =
+    Number(probability);
+
+  if (!name) {
+    return {
+      ok: false,
+      message: "❌ Укажите название."
+    };
+  }
+
+  if (
+    !Number.isFinite(value) ||
+    value < 0
+  ) {
+    return {
+      ok: false,
+      message: "❌ Некорректное значение."
+    };
+  }
+
+  if (
+    !Number.isFinite(chance) ||
+    chance < 0 ||
+    chance > 100
+  ) {
+    return {
+      ok: false,
+      message:
+        "❌ Вероятность должна быть от 0 до 100."
+    };
+  }
+
+  const maxOrder =
+    await dbGet(
+      env,
+      `SELECT COALESCE(
+         MAX(sort_order),
+         0
+       ) AS value
+       FROM wheel_prizes`
+    );
+
+  const sortOrder =
+    Number(maxOrder?.value || 0) + 1;
+
+  await dbRun(
+    env,
+    `INSERT INTO wheel_prizes
+     (
+       name,
+       prize_type,
+       prize_value,
+       probability,
+       enabled,
+       sort_order
+     )
+     VALUES (?, ?, ?, ?, 1, ?)`,
+    name,
+    prizeType || "uc",
+    value,
+    chance,
+    sortOrder
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    "wheel_prize_add",
+    null,
+    value,
+    `probability=${chance}`
+  );
+
+  return {
+    ok: true
+  };
+}
+
+/* ============================================================
+   DISABLE WHEEL PRIZE
+   ============================================================ */
+
+async function disableWheelPrize(
+  env,
+  adminTelegramId,
+  prizeId
+) {
+  const id =
+    Number(prizeId);
+
+  if (!Number.isInteger(id)) {
+    return {
+      ok: false,
+      message: "❌ Некорректный ID."
+    };
+  }
+
+  await dbRun(
+    env,
+    `UPDATE wheel_prizes
+     SET enabled = 0,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    id
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    "wheel_prize_disable",
+    null,
+    0,
+    `prize_id=${id}`
+  );
+
+  return {
+    ok: true
+  };
+}
+
+/* ============================================================
+   SHOW WHEEL
+   ============================================================ */
+
+async function showWheelAdmin(
+  chatId,
+  telegramId,
+  env
+) {
+  const settings =
+    await getWheelSettings(env);
+
+  const prizes =
+    await getWheelPrizes(env);
+
+  let text =
+    "<b>🎡 УПРАВЛЕНИЕ КОЛЕСОМ</b>\n\n";
+
+  text +=
+    `Статус: ${
+      Number(settings.enabled)
+        ? "🟢 включено"
+        : "🔴 выключено"
+    }\n`;
+
+  text +=
+    `Цена: <b>${settings.spin_cost}</b> ${escapeHtml(
+      settings.currency || "RUB"
+    )}\n\n`;
+
+  text += "<b>🎁 Награды:</b>\n";
+
+  if (!prizes.length) {
+    text += "Нет активных наград.\n";
+  }
+
+  for (const prize of prizes) {
+    text +=
+      `\n#${prize.id} — ${escapeHtml(
+        prize.name
+      )}\n`;
+
+    text +=
+      `Тип: ${escapeHtml(
+        prize.prize_type
+      )}\n`;
+
+    text +=
+      `Значение: ${prize.prize_value}\n`;
+
+    text +=
+      `Шанс: ${prize.probability}%\n`;
+  }
+
+  await sendMessage(
+    chatId,
+    text,
+    env,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "💰 ИЗМЕНИТЬ ЦЕНУ",
+              callback_data:
+                "wheel_set_price"
+            }
+          ],
+          [
+            {
+              text:
+                Number(settings.enabled)
+                  ? "🔴 ВЫКЛЮЧИТЬ"
+                  : "🟢 ВКЛЮЧИТЬ",
+              callback_data:
+                Number(settings.enabled)
+                  ? "wheel_disable"
+                  : "wheel_enable"
+            }
+          ],
+          [
+            {
+              text: "🎁 ОБНОВИТЬ НАГРАДЫ",
+              callback_data:
+                "wheel_refresh"
+            }
+          ],
+          [
+            {
+              text: "⬅️ НАЗАД",
+              callback_data:
+                "admin_panel"
+            }
+          ]
+        ]
+      }
+    }
+  );
+}
+
+/* ============================================================
+   COMPLAINTS
+   ============================================================ */
+
+async function getPendingComplaints(env) {
+  return dbAll(
+    env,
+    `SELECT *
+     FROM complaints
+     WHERE status = 'pending'
+     ORDER BY id ASC
+     LIMIT 20`
+  );
+}
+
+async function showComplaints(
+  chatId,
+  adminTelegramId,
+  env
+) {
+  const employee =
+    await getEmployeeByTelegramId(
+      env,
+      adminTelegramId
+    );
+
+  if (
+    !employee ||
+    Number(employee.rank || 0) < 1
+  ) {
+    return;
+  }
+
+  const complaints =
+    await getPendingComplaints(env);
+
+  let text =
+    "<b>📋 ЖАЛОБЫ</b>\n\n";
+
+  if (!complaints.length) {
+    text += "Активных жалоб нет.";
+  } else {
+    for (const complaint of complaints) {
+      text +=
+        `<b>#${complaint.id}</b> ` +
+        `${escapeHtml(
+          complaint.target_role
+        )}\n`;
+
+      text +=
+        `От: <code>${escapeHtml(
+          complaint.reporter_telegram_id
+        )}</code>\n`;
+
+      text +=
+        `На: <code>${escapeHtml(
+          complaint.target_telegram_id
+        )}</code>\n`;
+
+      text +=
+        `${escapeHtml(
+          complaint.complaint_text
+        )}\n\n`;
+    }
+  }
+
+  await sendMessage(
+    chatId,
+    text,
+    env
+  );
+}
+
+/* ============================================================
+   EMPLOYEE LOOKUP
+   ============================================================ */
+
+async function getEmployeeByTelegramId(
+  env,
+  telegramId
+) {
+  return dbGet(
+    env,
+    `SELECT
+       u.*,
+       ar.role AS admin_role
+     FROM users u
+     LEFT JOIN admin_roles ar
+       ON ar.telegram_id = u.telegram_id
+     WHERE u.telegram_id = ?
+     LIMIT 1`,
+    String(telegramId)
+  );
+}
+
+/* ============================================================
+   ROLE SETTINGS
+   ============================================================ */
+
+async function getRoleSettings(env) {
+  return dbAll(
+    env,
+    `SELECT *
+     FROM role_settings
+     ORDER BY rank ASC`
+  );
+}
+
+async function getRankPermissions(env) {
+  return dbAll(
+    env,
+    `SELECT *
+     FROM rank_permissions
+     ORDER BY rank ASC`
+  );
+}
+
+/* ============================================================
+   SYSTEM SETTINGS
+   ============================================================ */
+
+async function getSystemSetting(
+  env,
+  key,
+  fallback = null
+) {
+  const row =
+    await dbGet(
+      env,
+      `SELECT value
+       FROM system_settings
+       WHERE key = ?
+       LIMIT 1`,
+      String(key)
+    );
+
+  return row
+    ? row.value
+    : fallback;
+}
+
+async function setSystemSetting(
+  env,
+  adminTelegramId,
+  key,
   value
 ) {
-  const number =
-    Number(value || 0);
+  await dbRun(
+    env,
+    `INSERT INTO system_settings
+     (
+       key,
+       value,
+       updated_by,
+       updated_at
+     )
+     VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(key)
+     DO UPDATE SET
+       value = excluded.value,
+       updated_by = excluded.updated_by,
+       updated_at = CURRENT_TIMESTAMP`,
+    String(key),
+    String(value),
+    String(adminTelegramId)
+  );
 
-  return number
-    .toLocaleString(
-      "ru-RU",
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    "system_setting",
+    null,
+    0,
+    `${key}=${value}`
+  );
+}
+
+/* ============================================================
+   MAINTENANCE
+   ============================================================ */
+
+async function setMaintenance(
+  env,
+  adminTelegramId,
+  enabled
+) {
+  const value =
+    enabled ? "1" : "0";
+
+  await setSystemSetting(
+    env,
+    adminTelegramId,
+    "maintenance",
+    value
+  );
+
+  return {
+    ok: true,
+    enabled: value === "1"
+  };
+}
+
+async function isMaintenanceEnabled(env) {
+  const value =
+    await getSystemSetting(
+      env,
+      "maintenance",
+      "0"
+    );
+
+  return String(value) === "1";
+}
+
+/* ============================================================
+   ADMIN LIST
+   ============================================================ */
+
+async function getAdmins(env) {
+  return dbAll(
+    env,
+    `SELECT
+       u.telegram_id,
+       u.username,
+       u.first_name,
+       u.last_name,
+       u.role,
+       u.rank,
+       u.panel_status,
+       ar.role AS admin_role
+     FROM users u
+     LEFT JOIN admin_roles ar
+       ON ar.telegram_id = u.telegram_id
+     WHERE u.rank > 0
+        OR ar.telegram_id IS NOT NULL
+     ORDER BY u.rank DESC, u.id ASC`
+  );
+}
+
+/* ============================================================
+   MODERATORS
+   ============================================================ */
+
+async function getModerators(env) {
+  return dbAll(
+    env,
+    `SELECT
+       u.telegram_id,
+       u.username,
+       u.first_name,
+       u.last_name,
+       u.role,
+       u.rank,
+       u.panel_status
+     FROM users u
+     WHERE u.role = 'moderator'
+     ORDER BY u.id ASC`
+  );
+}
+
+/* ============================================================
+   UPDATE PANEL STATUS
+   ============================================================ */
+
+async function setPanelStatus(
+  env,
+  telegramId,
+  status
+) {
+  await dbRun(
+    env,
+    `UPDATE users
+     SET panel_status = ?,
+         panel_last_activity = CURRENT_TIMESTAMP,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE telegram_id = ?`,
+    String(status),
+    String(telegramId)
+  );
+}
+
+/* ============================================================
+   ACTIVITY
+   ============================================================ */
+
+async function getAdminActionsToday(
+  env,
+  telegramId
+) {
+  const row =
+    await dbGet(
+      env,
+      `SELECT COUNT(*) AS count
+       FROM admin_actions
+       WHERE admin_telegram_id = ?
+       AND date(created_at) = date('now')`,
+      String(telegramId)
+    );
+
+  return Number(row?.count || 0);
+}
+
+async function getAdminActionHistory(
+  env,
+  telegramId,
+  limit = 20
+) {
+  return dbAll(
+    env,
+    `SELECT *
+     FROM admin_actions
+     WHERE admin_telegram_id = ?
+     ORDER BY id DESC
+     LIMIT ?`,
+    String(telegramId),
+    Number(limit)
+  );
+}
+
+/* ============================================================
+   PANEL HOME
+   ============================================================ */
+
+async function sendAdminPanel(
+  chatId,
+  employee,
+  env
+) {
+  const actions =
+    await getAdminActionsToday(
+      env,
+      employee.telegram_id
+    );
+
+  const wheel =
+    await getWheelSettings(env);
+
+  const maintenance =
+    await isMaintenanceEnabled(env);
+
+  const rank =
+    Number(employee.rank || 0);
+
+  const rankName =
+    rank === 6
+      ? "Главный Администратор"
+      : rank === 5
+        ? "Заместитель Главного Администратора"
+        : rank === 4
+          ? "Куратор"
+          : rank === 3
+            ? "Следящий администратор"
+            : rank === 2
+              ? "Администратор"
+              : rank === 1
+                ? "Администратор"
+                : "Сотрудник";
+
+  const buttons = [
+    [
       {
-        minimumFractionDigits: 0,
-        maximumFractionDigits: 2
+        text: "👤 ПОИСК ИГРОКА",
+        callback_data: "admin_search"
+      }
+    ],
+    [
+      {
+        text: "👮 АДМИНИСТРАТОРЫ",
+        callback_data: "admins_list"
+      },
+      {
+        text: "🛡 МОДЕРАТОРЫ",
+        callback_data: "moder_list"
+      }
+    ],
+    [
+      {
+        text: "🎡 КОЛЕСО",
+        callback_data: "wheel_admin"
+      }
+    ],
+    [
+      {
+        text: "📋 ЖАЛОБЫ",
+        callback_data: "moder_complaints"
+      }
+    ],
+    [
+      {
+        text: "📊 МОЯ АКТИВНОСТЬ",
+        callback_data: "my_activity"
+      }
+    ]
+  ];
+
+  if (rank >= 5) {
+    buttons.push([
+      {
+        text: maintenance
+          ? "🟢 ТЕХРАБОТЫ: ВЫКЛ"
+          : "🔴 ТЕХРАБОТЫ: ВКЛ",
+        callback_data:
+          maintenance
+            ? "maintenance_off"
+            : "maintenance_on"
+      }
+    ]);
+  }
+
+  buttons.push([
+    {
+      text: "🚪 ВЫЙТИ",
+      callback_data: "panel_logout"
+    }
+  ]);
+
+  await sendMessage(
+    chatId,
+    `<b>🛠 АДМИН-ПАНЕЛЬ</b>
+
+Сотрудник:
+<b>${escapeHtml(
+      employee.first_name ||
+      employee.username ||
+      employee.telegram_id
+    )}</b>
+
+Ранг:
+<b>${escapeHtml(
+      rankName
+    )}</b>
+
+Сегодня действий:
+<b>${actions}</b>
+
+Колесо:
+${
+  Number(wheel.enabled)
+    ? "🟢 включено"
+    : "🔴 выключено"
+}
+
+Техработы:
+${
+  maintenance
+    ? "🔴 включены"
+    : "🟢 выключены"
+}`,
+    env,
+    {
+      reply_markup: {
+        inline_keyboard: buttons
+      }
+    }
+  );
+}
+/* ============================================================
+   DOXACHKAA UC — worker.js
+   ЧАСТЬ 4/5
+   CALLBACKS + INPUT + MODERATION + SUPPORT
+   ============================================================ */
+
+/* ============================================================
+   CALLBACK HANDLER
+   ============================================================ */
+
+async function handlePanelCallback(
+  data,
+  chatId,
+  telegramId,
+  env
+) {
+  const employee =
+    await getEmployeeByTelegramId(
+      env,
+      telegramId
+    );
+
+  if (!employee) {
+    await answerCallback(
+      arguments[0]?.id || "",
+      env,
+      "❌ Доступ запрещён."
+    ).catch(() => {});
+
+    return;
+  }
+
+  const rank =
+    Number(employee.rank || 0);
+
+  if (data === "panel_logout") {
+    await setPanelStatus(
+      env,
+      telegramId,
+      "offline"
+    );
+
+    await logAdminAction(
+      env,
+      telegramId,
+      "panel_logout"
+    );
+
+    await sendMessage(
+      chatId,
+      "🔒 Панель закрыта.",
+      env
+    );
+
+    return;
+  }
+
+  if (data === "admin_panel") {
+    if (rank < 1) return;
+
+    await setPanelStatus(
+      env,
+      telegramId,
+      "online"
+    );
+
+    await sendAdminPanel(
+      chatId,
+      employee,
+      env
+    );
+
+    return;
+  }
+
+  if (data === "moder_panel") {
+    if (
+      employee.role !== "moderator" &&
+      rank < 1
+    ) {
+      return;
+    }
+
+    await setPanelStatus(
+      env,
+      telegramId,
+      "online"
+    );
+
+    await sendModeratorPanel(
+      chatId,
+      employee,
+      env
+    );
+
+    return;
+  }
+
+  if (data === "admins_list") {
+    if (rank < 1) return;
+
+    const admins =
+      await getAdmins(env);
+
+    let text =
+      "<b>👮 АДМИНИСТРАТОРЫ</b>\n\n";
+
+    if (!admins.length) {
+      text += "Администраторов нет.";
+    }
+
+    for (const admin of admins) {
+      text +=
+        `👤 <b>${escapeHtml(
+          admin.first_name ||
+          admin.username ||
+          "Без имени"
+        )}</b>\n`;
+
+      text +=
+        `ID: <code>${escapeHtml(
+          admin.telegram_id
+        )}</code>\n`;
+
+      text +=
+        `Ранг: <b>${Number(
+          admin.rank || 0
+        )}</b>\n`;
+
+      text +=
+        `Статус: ${
+          admin.panel_status === "online"
+            ? "🟢 онлайн"
+            : "⚫ офлайн"
+        }\n\n`;
+    }
+
+    await sendMessage(
+      chatId,
+      text,
+      env,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "⬅️ НАЗАД",
+                callback_data:
+                  "admin_panel"
+              }
+            ]
+          ]
+        }
       }
     );
-}
 
-function escapeHtml(
-  value
-) {
-  return String(
-    value ?? ""
-  )
-    .replaceAll(
-      "&",
-      "&amp;"
-    )
-    .replaceAll(
-      "<",
-      "&lt;"
-    )
-    .replaceAll(
-      ">",
-      "&gt;"
-    )
-    .replaceAll(
-      '"',
-      "&quot;"
-    )
-    .replaceAll(
-      "'",
-      "&#039;"
-    );
-}
-
-function formatTime(
-  value
-) {
-  if (!value) {
-    return "--:--";
+    return;
   }
+
+  if (data === "moder_list") {
+    if (rank < 1) return;
+
+    const moderators =
+      await getModerators(env);
+
+    let text =
+      "<b>🛡 МОДЕРАТОРЫ</b>\n\n";
+
+    if (!moderators.length) {
+      text += "Модераторов нет.";
+    }
+
+    for (const moderator of moderators) {
+      text +=
+        `🛡 <b>${escapeHtml(
+          moderator.first_name ||
+          moderator.username ||
+          "Без имени"
+        )}</b>\n`;
+
+      text +=
+        `ID: <code>${escapeHtml(
+          moderator.telegram_id
+        )}</code>\n`;
+
+      text +=
+        `Статус: ${
+          moderator.panel_status ===
+          "online"
+            ? "🟢 онлайн"
+            : "⚫ офлайн"
+        }\n\n`;
+    }
+
+    await sendMessage(
+      chatId,
+      text,
+      env,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "⬅️ НАЗАД",
+                callback_data:
+                  "admin_panel"
+              }
+            ]
+          ]
+        }
+      }
+    );
+
+    return;
+  }
+
+  if (data === "my_activity") {
+    if (rank < 1) return;
+
+    const count =
+      await getAdminActionsToday(
+        env,
+        telegramId
+      );
+
+    const history =
+      await getAdminActionHistory(
+        env,
+        telegramId,
+        10
+      );
+
+    let text =
+      "<b>📊 МОЯ АКТИВНОСТЬ</b>\n\n";
+
+    text +=
+      `Действий сегодня: <b>${count}</b>\n\n`;
+
+    text +=
+      "<b>Последние действия:</b>\n";
+
+    if (!history.length) {
+      text += "Нет действий.";
+    } else {
+      for (const row of history) {
+        text +=
+          `• ${formatTime(
+            row.created_at
+          )} — ${escapeHtml(
+            row.action
+          )}\n`;
+      }
+    }
+
+    await sendMessage(
+      chatId,
+      text,
+      env
+    );
+
+    return;
+  }
+
+  /* ==========================================================
+     MAINTENANCE
+     ========================================================== */
+
+  if (data === "maintenance_on") {
+    if (rank < 5) return;
+
+    await setMaintenance(
+      env,
+      telegramId,
+      true
+    );
+
+    await sendMessage(
+      chatId,
+      "🔴 Технические работы <b>ВКЛЮЧЕНЫ</b>.",
+      env
+    );
+
+    return;
+  }
+
+  if (data === "maintenance_off") {
+    if (rank < 5) return;
+
+    await setMaintenance(
+      env,
+      telegramId,
+      false
+    );
+
+    await sendMessage(
+      chatId,
+      "🟢 Технические работы <b>ВЫКЛЮЧЕНЫ</b>.",
+      env
+    );
+
+    return;
+  }
+
+  /* ==========================================================
+     WHEEL
+     ========================================================== */
+
+  if (data === "wheel_admin") {
+    if (rank < 5) return;
+
+    await showWheelAdmin(
+      chatId,
+      telegramId,
+      env
+    );
+
+    return;
+  }
+
+  if (data === "wheel_enable") {
+    if (rank < 5) return;
+
+    await setWheelEnabled(
+      env,
+      telegramId,
+      true
+    );
+
+    await sendMessage(
+      chatId,
+      "🎡 Колесо <b>ВКЛЮЧЕНО</b>.",
+      env
+    );
+
+    return;
+  }
+
+  if (data === "wheel_disable") {
+    if (rank < 5) return;
+
+    await setWheelEnabled(
+      env,
+      telegramId,
+      false
+    );
+
+    await sendMessage(
+      chatId,
+      "🎡 Колесо <b>ВЫКЛЮЧЕНО</b>.",
+      env
+    );
+
+    return;
+  }
+
+  if (data === "wheel_set_price") {
+    if (rank < 5) return;
+
+    await requestPanelInput(
+      env,
+      telegramId,
+      "wheel_price",
+      chatId,
+      "💰 Введите новую цену вращения в ₽:"
+    );
+
+    return;
+  }
+
+  if (data === "wheel_refresh") {
+    if (rank < 5) return;
+
+    await showWheelAdmin(
+      chatId,
+      telegramId,
+      env
+    );
+
+    return;
+  }
+
+  /* ==========================================================
+     SEARCH
+     ========================================================== */
+
+  if (data === "admin_search") {
+    if (rank < 1) return;
+
+    await requestPanelInput(
+      env,
+      telegramId,
+      "user_search",
+      chatId,
+      "🔎 Введите Telegram ID, username или имя игрока:"
+    );
+
+    return;
+  }
+
+  /* ==========================================================
+     COMPLAINTS
+     ========================================================== */
+
+  if (data === "moder_complaints") {
+    if (rank < 1) return;
+
+    await showComplaints(
+      chatId,
+      telegramId,
+      env
+    );
+
+    return;
+  }
+
+  /* ==========================================================
+     UNKNOWN CALLBACK
+     ========================================================== */
+
+  await sendMessage(
+    chatId,
+    "⚠️ Эта кнопка больше недоступна.",
+    env
+  );
+}
+
+/* ============================================================
+   PANEL INPUT STATE
+   ============================================================ */
+
+async function requestPanelInput(
+  env,
+  telegramId,
+  state,
+  chatId,
+  message
+) {
+  await setSystemSetting(
+    env,
+    telegramId,
+    `panel_input:${telegramId}`,
+    state
+  );
+
+  await sendMessage(
+    chatId,
+    message,
+    env
+  );
+}
+
+async function getPanelInputState(
+  env,
+  telegramId
+) {
+  return getSystemSetting(
+    env,
+    `panel_input:${telegramId}`,
+    null
+  );
+}
+
+async function clearPanelInputState(
+  env,
+  telegramId
+) {
+  await dbRun(
+    env,
+    `DELETE FROM system_settings
+     WHERE key = ?`,
+    `panel_input:${telegramId}`
+  );
+}
+
+/* ============================================================
+   TEXT STATE
+   ============================================================ */
+
+async function handleTextState(
+  message,
+  env
+) {
+  const telegramId =
+    String(message.from.id);
+
+  const state =
+    await getPanelInputState(
+      env,
+      telegramId
+    );
+
+  if (!state) {
+    return false;
+  }
+
+  const employee =
+    await getEmployeeByTelegramId(
+      env,
+      telegramId
+    );
+
+  if (!employee) {
+    await clearPanelInputState(
+      env,
+      telegramId
+    );
+
+    return true;
+  }
+
+  const value =
+    String(message.text || "").trim();
+
+  if (!value) {
+    return true;
+  }
+
+  /* ==========================================================
+     WHEEL PRICE
+     ========================================================== */
+
+  if (state === "wheel_price") {
+    if (Number(employee.rank) < 5) {
+      await clearPanelInputState(
+        env,
+        telegramId
+      );
+
+      return true;
+    }
+
+    const price =
+      Number(value);
+
+    if (
+      !Number.isFinite(price) ||
+      price < 0
+    ) {
+      await sendMessage(
+        message.chat.id,
+        "❌ Введите корректную цену.",
+        env
+      );
+
+      return true;
+    }
+
+    const result =
+      await setWheelPrice(
+        env,
+        telegramId,
+        price
+      );
+
+    await clearPanelInputState(
+      env,
+      telegramId
+    );
+
+    await sendMessage(
+      message.chat.id,
+      result.ok
+        ? `✅ Цена вращения изменена на <b>${price}</b> ₽.`
+        : result.message,
+      env
+    );
+
+    return true;
+  }
+
+  /* ==========================================================
+     USER SEARCH
+     ========================================================== */
+
+  if (state === "user_search") {
+    if (Number(employee.rank) < 1) {
+      await clearPanelInputState(
+        env,
+        telegramId
+      );
+
+      return true;
+    }
+
+    const users =
+      await searchUser(
+        env,
+        value
+      );
+
+    await clearPanelInputState(
+      env,
+      telegramId
+    );
+
+    if (!users.length) {
+      await sendMessage(
+        message.chat.id,
+        "❌ Пользователь не найден.",
+        env
+      );
+
+      return true;
+    }
+
+    let text =
+      "<b>🔎 РЕЗУЛЬТАТ ПОИСКА</b>\n\n";
+
+    for (const user of users) {
+      text +=
+        `👤 <b>${escapeHtml(
+          user.first_name ||
+          user.username ||
+          "Без имени"
+        )}</b>\n`;
+
+      text +=
+        `ID: <code>${escapeHtml(
+          user.telegram_id
+        )}</code>\n`;
+
+      text +=
+        `Баланс: <b>${Number(
+          user.balance || 0
+        )}</b> ₽\n`;
+
+      text +=
+        `UC: <b>${Number(
+          user.uc || 0
+        )}</b>\n`;
+
+      text +=
+        `Роль: ${escapeHtml(
+          user.role || "player"
+        )}\n`;
+
+      text +=
+        `Ранг: ${Number(
+          user.rank || 0
+        )}\n\n`;
+    }
+
+    await sendMessage(
+      message.chat.id,
+      text,
+      env
+    );
+
+    return true;
+  }
+
+  return false;
+}
+
+/* ============================================================
+   MODERATOR PANEL
+   ============================================================ */
+
+async function sendModeratorPanel(
+  chatId,
+  employee,
+  env
+) {
+  const complaints =
+    await getPendingComplaints(env);
+
+  await sendMessage(
+    chatId,
+    `<b>🛡 ПАНЕЛЬ МОДЕРАТОРА</b>
+
+Сотрудник:
+<b>${escapeHtml(
+      employee.first_name ||
+      employee.username ||
+      employee.telegram_id
+    )}</b>
+
+Активных жалоб:
+<b>${complaints.length}</b>`,
+    env,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "📋 ЖАЛОБЫ",
+              callback_data:
+                "moder_complaints"
+            }
+          ],
+          [
+            {
+              text: "📊 МОЯ АКТИВНОСТЬ",
+              callback_data:
+                "my_activity"
+            }
+          ],
+          [
+            {
+              text: "🚪 ВЫЙТИ",
+              callback_data:
+                "panel_logout"
+            }
+          ]
+        ]
+      }
+    }
+  );
+}
+
+/* ============================================================
+   SUPPORT TICKETS
+   ============================================================ */
+
+async function createSupportTicket(
+  env,
+  telegramId,
+  subject
+) {
+  const existing =
+    await dbGet(
+      env,
+      `SELECT id
+       FROM support_tickets
+       WHERE player_telegram_id = ?
+       AND status = 'open'
+       ORDER BY id DESC
+       LIMIT 1`,
+      String(telegramId)
+    );
+
+  if (existing) {
+    return {
+      ok: false,
+      ticketId: existing.id,
+      message:
+        "❌ У вас уже есть открытый тикет."
+    };
+  }
+
+  const result =
+    await dbRun(
+      env,
+      `INSERT INTO support_tickets
+       (
+         player_telegram_id,
+         subject,
+         status
+       )
+       VALUES (?, ?, 'open')`,
+      String(telegramId),
+      subject || "Без темы"
+    );
+
+  const ticket =
+    await dbGet(
+      env,
+      `SELECT *
+       FROM support_tickets
+       WHERE player_telegram_id = ?
+       ORDER BY id DESC
+       LIMIT 1`,
+      String(telegramId)
+    );
+
+  return {
+    ok: true,
+    ticketId:
+      ticket?.id ||
+      result?.meta?.last_row_id ||
+      null
+  };
+}
+
+/* ============================================================
+   SUPPORT MESSAGE
+   ============================================================ */
+
+async function addSupportMessage(
+  env,
+  ticketId,
+  senderTelegramId,
+  senderRole,
+  message
+) {
+  const ticket =
+    await dbGet(
+      env,
+      `SELECT id
+       FROM support_tickets
+       WHERE id = ?
+       LIMIT 1`,
+      Number(ticketId)
+    );
+
+  if (!ticket) {
+    return {
+      ok: false,
+      message: "❌ Тикет не найден."
+    };
+  }
+
+  await dbRun(
+    env,
+    `INSERT INTO support_messages
+     (
+       ticket_id,
+       sender_telegram_id,
+       sender_role,
+       message
+     )
+     VALUES (?, ?, ?, ?)`,
+    Number(ticketId),
+    String(senderTelegramId),
+    String(senderRole || "player"),
+    String(message)
+  );
+
+  return {
+    ok: true
+  };
+}
+
+/* ============================================================
+   CLOSE SUPPORT TICKET
+   ============================================================ */
+
+async function closeSupportTicket(
+  env,
+  ticketId,
+  adminTelegramId
+) {
+  const ticket =
+    await dbGet(
+      env,
+      `SELECT *
+       FROM support_tickets
+       WHERE id = ?
+       LIMIT 1`,
+      Number(ticketId)
+    );
+
+  if (!ticket) {
+    return {
+      ok: false,
+      message: "❌ Тикет не найден."
+    };
+  }
+
+  await dbRun(
+    env,
+    `UPDATE support_tickets
+     SET status = 'closed',
+         closed_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    Number(ticketId)
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    "support_close",
+    ticket.player_telegram_id,
+    0,
+    `ticket_id=${ticketId}`
+  );
+
+  return {
+    ok: true
+  };
+}
+
+/* ============================================================
+   GET TICKET
+   ============================================================ */
+
+async function getSupportTicket(
+  env,
+  ticketId
+) {
+  const ticket =
+    await dbGet(
+      env,
+      `SELECT *
+       FROM support_tickets
+       WHERE id = ?
+       LIMIT 1`,
+      Number(ticketId)
+    );
+
+  if (!ticket) {
+    return null;
+  }
+
+  const messages =
+    await dbAll(
+      env,
+      `SELECT *
+       FROM support_messages
+       WHERE ticket_id = ?
+       ORDER BY id ASC`,
+      Number(ticketId)
+    );
+
+  return {
+    ticket,
+    messages
+  };
+}
+
+/* ============================================================
+   OPEN TICKETS
+   ============================================================ */
+
+async function getOpenTickets(env) {
+  return dbAll(
+    env,
+    `SELECT *
+     FROM support_tickets
+     WHERE status = 'open'
+     ORDER BY id ASC
+     LIMIT 50`
+  );
+}
+
+/* ============================================================
+   PAYMENT REQUESTS
+   ============================================================ */
+
+async function getPendingPayments(env) {
+  return dbAll(
+    env,
+    `SELECT *
+     FROM payments
+     WHERE status = 'pending'
+     ORDER BY id ASC
+     LIMIT 50`
+  );
+}
+
+async function getPendingTopups(env) {
+  return dbAll(
+    env,
+    `SELECT *
+     FROM topup_requests
+     WHERE status = 'pending'
+     ORDER BY id ASC
+     LIMIT 50`
+  );
+}
+
+async function getPendingPayouts(env) {
+  return dbAll(
+    env,
+    `SELECT *
+     FROM payout_requests
+     WHERE status = 'pending'
+     ORDER BY id ASC
+     LIMIT 50`
+  );
+}
+
+/* ============================================================
+   PAYMENT STATUS
+   ============================================================ */
+
+async function updatePaymentStatus(
+  env,
+  adminTelegramId,
+  paymentId,
+  status
+) {
+  const allowed = [
+    "pending",
+    "paid",
+    "cancelled",
+    "failed"
+  ];
+
+  if (!allowed.includes(status)) {
+    return {
+      ok: false,
+      message: "❌ Некорректный статус."
+    };
+  }
+
+  const payment =
+    await dbGet(
+      env,
+      `SELECT *
+       FROM payments
+       WHERE id = ?
+       LIMIT 1`,
+      Number(paymentId)
+    );
+
+  if (!payment) {
+    return {
+      ok: false,
+      message: "❌ Платёж не найден."
+    };
+  }
+
+  await dbRun(
+    env,
+    `UPDATE payments
+     SET status = ?,
+         paid_at =
+           CASE
+             WHEN ? = 'paid'
+             THEN CURRENT_TIMESTAMP
+             ELSE paid_at
+           END
+     WHERE id = ?`,
+    status,
+    status,
+    Number(paymentId)
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    "payment_status",
+    payment.telegram_id,
+    payment.amount,
+    `payment_id=${paymentId}; status=${status}`
+  );
+
+  return {
+    ok: true
+  };
+}
+
+/* ============================================================
+   TOPUP STATUS
+   ============================================================ */
+
+async function updateTopupStatus(
+  env,
+  adminTelegramId,
+  requestId,
+  status
+) {
+  const allowed = [
+    "pending",
+    "approved",
+    "rejected"
+  ];
+
+  if (!allowed.includes(status)) {
+    return {
+      ok: false,
+      message: "❌ Некорректный статус."
+    };
+  }
+
+  const request =
+    await dbGet(
+      env,
+      `SELECT *
+       FROM topup_requests
+       WHERE id = ?
+       LIMIT 1`,
+      Number(requestId)
+    );
+
+  if (!request) {
+    return {
+      ok: false,
+      message: "❌ Заявка не найдена."
+    };
+  }
+
+  await dbRun(
+    env,
+    `UPDATE topup_requests
+     SET status = ?
+     WHERE id = ?`,
+    status,
+    Number(requestId)
+  );
+
+  await logAdminAction(
+    env,
+    adminTelegramId,
+    "topup_status",
+    request.telegram_id,
+    request.amount,
+    `request_id=${requestId}; status=${status}`
+  );
+
+  return {
+    ok: true
+  };
+       }
+/* ============================================================
+   DOXACHKAA UC — worker.js
+   ЧАСТЬ 5/5
+   ФИНАЛЬНАЯ ЧАСТЬ
+   ============================================================ */
+
+/* ============================================================
+   DAILY BONUS
+   ============================================================ */
+
+async function claimDailyBonus(
+  env,
+  telegramId
+) {
+  const user = await dbGet(
+    env,
+    `SELECT *
+     FROM users
+     WHERE telegram_id = ?
+     LIMIT 1`,
+    String(telegramId)
+  );
+
+  if (!user) {
+    return {
+      ok: false,
+      message: "❌ Пользователь не найден."
+    };
+  }
+
+  const today = getMoscowDate();
+
+  const existing = await dbGet(
+    env,
+    `SELECT id
+     FROM transactions
+     WHERE telegram_id = ?
+     AND type = 'daily_bonus'
+     AND date(created_at) = ?
+     LIMIT 1`,
+    String(telegramId),
+    today
+  );
+
+  if (existing) {
+    return {
+      ok: false,
+      message: "❌ Ежедневный бонус уже получен сегодня."
+    };
+  }
+
+  const reward = 1;
+
+  await dbRun(
+    env,
+    `UPDATE users
+     SET uc = uc + ?,
+         updated_at = datetime('now')
+     WHERE telegram_id = ?`,
+    reward,
+    String(telegramId)
+  );
+
+  await dbRun(
+    env,
+    `INSERT INTO transactions
+     (
+       telegram_id,
+       type,
+       amount,
+       description,
+       created_at
+     )
+     VALUES (?, 'daily_bonus', ?, ?, datetime('now'))`,
+    String(telegramId),
+    reward,
+    "Ежедневный бонус"
+  );
+
+  return {
+    ok: true,
+    reward
+  };
+}
+
+
+/* ============================================================
+   PROMOCODE
+   ============================================================ */
+
+/*
+ * В текущей D1-схеме отдельной таблицы промокодов нет.
+ *
+ * Поэтому здесь НЕ выполняется запрос к несуществующим
+ * promo_codes / promo_uses.
+ *
+ * Когда таблицы промокодов будут добавлены,
+ * сюда можно подключить полноценную систему.
+ */
+
+async function usePromoCode(
+  env,
+  telegramId,
+  code
+) {
+  return {
+    ok: false,
+    message:
+      "❌ Система промокодов пока не подключена к текущей базе."
+  };
+}
+
+
+/* ============================================================
+   DAILY ACTION COUNT
+   ============================================================ */
+
+async function getDailyActionCount(
+  env,
+  employeeId
+) {
+  /*
+   * employee_actions отсутствует в текущей схеме.
+   *
+   * Используем admin_actions как журнал действий
+   * сотрудников.
+   */
+
+  const employee = await getEmployeeById(
+    env,
+    employeeId
+  );
+
+  if (!employee) return 0;
+
+  const row = await dbGet(
+    env,
+    `SELECT COUNT(*) AS count
+     FROM admin_actions
+     WHERE admin_telegram_id = ?
+     AND date(created_at) = date('now')`,
+    String(employee.telegram_id)
+  );
+
+  return Number(row?.count || 0);
+}
+
+
+/* ============================================================
+   GLOBAL SEARCH
+   ============================================================ */
+
+async function globalSearch(
+  env,
+  query
+) {
+  const q = String(query || "").trim();
+
+  if (!q) {
+    return {
+      users: [],
+      payments: [],
+      payouts: [],
+      tickets: []
+    };
+  }
+
+  const users = await dbAll(
+    env,
+    `SELECT
+       id,
+       telegram_id,
+       username,
+       first_name,
+       last_name,
+       role,
+       rank,
+       balance,
+       uc,
+       created_at
+     FROM users
+     WHERE telegram_id = ?
+        OR username LIKE ?
+        OR first_name LIKE ?
+        OR last_name LIKE ?
+     ORDER BY id DESC
+     LIMIT 20`,
+    q,
+    `%${q}%`,
+    `%${q}%`,
+    `%${q}%`
+  );
+
+  let payments = [];
+
+  if (/^\d+$/.test(q)) {
+    payments = await dbAll(
+      env,
+      `SELECT *
+       FROM payments
+       WHERE id = ?
+       LIMIT 20`,
+      Number(q)
+    );
+  }
+
+  let payouts = [];
+
+  if (/^\d+$/.test(q)) {
+    payouts = await dbAll(
+      env,
+      `SELECT *
+       FROM payout_requests
+       WHERE id = ?
+       LIMIT 20`,
+      Number(q)
+    );
+  }
+
+  let tickets = [];
+
+  if (/^\d+$/.test(q)) {
+    tickets = await dbAll(
+      env,
+      `SELECT *
+       FROM support_tickets
+       WHERE id = ?
+       LIMIT 20`,
+      Number(q)
+    );
+  }
+
+  return {
+    users,
+    payments,
+    payouts,
+    tickets
+  };
+}
+
+
+/* ============================================================
+   USER CARD
+   ============================================================ */
+
+async function getPlayerCard(
+  env,
+  telegramId
+) {
+  const user = await dbGet(
+    env,
+    `SELECT *
+     FROM users
+     WHERE telegram_id = ?
+     LIMIT 1`,
+    String(telegramId)
+  );
+
+  if (!user) return null;
+
+  const transactions = await dbAll(
+    env,
+    `SELECT *
+     FROM transactions
+     WHERE telegram_id = ?
+     ORDER BY id DESC
+     LIMIT 30`,
+    String(telegramId)
+  );
+
+  const payments = await dbAll(
+    env,
+    `SELECT *
+     FROM payments
+     WHERE telegram_id = ?
+     ORDER BY id DESC
+     LIMIT 20`,
+    String(telegramId)
+  );
+
+  const payouts = await dbAll(
+    env,
+    `SELECT *
+     FROM payout_requests
+     WHERE telegram_id = ?
+     ORDER BY id DESC
+     LIMIT 20`,
+    String(telegramId)
+  );
+
+  const bans = await dbAll(
+    env,
+    `SELECT *
+     FROM bans
+     WHERE telegram_id = ?
+     ORDER BY created_at DESC`,
+    String(telegramId)
+  );
+
+  const silentBans = await dbAll(
+    env,
+    `SELECT *
+     FROM silent_bans
+     WHERE telegram_id = ?
+     ORDER BY created_at DESC`,
+    String(telegramId)
+  );
+
+  const tickets = await dbAll(
+    env,
+    `SELECT *
+     FROM support_tickets
+     WHERE player_telegram_id = ?
+     ORDER BY id DESC
+     LIMIT 20`,
+    String(telegramId)
+  );
+
+  const spins = await dbAll(
+    env,
+    `SELECT *
+     FROM spin_history
+     WHERE telegram_id = ?
+     ORDER BY id DESC
+     LIMIT 20`,
+    String(telegramId)
+  );
+
+  return {
+    user,
+    transactions,
+    payments,
+    payouts,
+    bans,
+    silentBans,
+    tickets,
+    spins
+  };
+}
+
+
+/* ============================================================
+   ADMIN ACTION HISTORY
+   ============================================================ */
+
+async function getAdminActionHistory(
+  env,
+  telegramId,
+  limit = 50
+) {
+  const safeLimit = Math.min(
+    Math.max(
+      Number(limit) || 50,
+      1
+    ),
+    100
+  );
+
+  return dbAll(
+    env,
+    `SELECT *
+     FROM admin_actions
+     WHERE admin_telegram_id = ?
+     ORDER BY id DESC
+     LIMIT ${safeLimit}`,
+    String(telegramId)
+  );
+}
+
+
+/* ============================================================
+   USER TRANSACTION HISTORY
+   ============================================================ */
+
+async function getUserTransactions(
+  env,
+  telegramId,
+  limit = 50
+) {
+  const safeLimit = Math.min(
+    Math.max(
+      Number(limit) || 50,
+      1
+    ),
+    100
+  );
+
+  return dbAll(
+    env,
+    `SELECT *
+     FROM transactions
+     WHERE telegram_id = ?
+     ORDER BY id DESC
+     LIMIT ${safeLimit}`,
+    String(telegramId)
+  );
+}
+
+
+/* ============================================================
+   USER SPIN HISTORY
+   ============================================================ */
+
+async function getUserSpinHistory(
+  env,
+  telegramId,
+  limit = 20
+) {
+  const safeLimit = Math.min(
+    Math.max(
+      Number(limit) || 20,
+      1
+    ),
+    100
+  );
+
+  return dbAll(
+    env,
+    `SELECT *
+     FROM spin_history
+     WHERE telegram_id = ?
+     ORDER BY id DESC
+     LIMIT ${safeLimit}`,
+    String(telegramId)
+  );
+}
+
+
+/* ============================================================
+   ACTIVE BAN CHECK
+   ============================================================ */
+
+async function getActiveBan(
+  env,
+  telegramId
+) {
+  return dbGet(
+    env,
+    `SELECT *
+     FROM bans
+     WHERE telegram_id = ?
+     AND (
+       expires_at IS NULL
+       OR expires_at > datetime('now')
+     )
+     LIMIT 1`,
+    String(telegramId)
+  );
+}
+
+
+/* ============================================================
+   ACTIVE SILENT BAN CHECK
+   ============================================================ */
+
+async function getActiveSilentBan(
+  env,
+  telegramId
+) {
+  return dbGet(
+    env,
+    `SELECT *
+     FROM silent_bans
+     WHERE telegram_id = ?
+     AND active = 1
+     AND (
+       expires_at IS NULL
+       OR expires_at > datetime('now')
+     )
+     ORDER BY id DESC
+     LIMIT 1`,
+    String(telegramId)
+  );
+}
+
+
+/* ============================================================
+   MAINTENANCE
+   ============================================================ */
+
+async function isMaintenanceEnabled(
+  env
+) {
+  const row = await dbGet(
+    env,
+    `SELECT value
+     FROM system_settings
+     WHERE key = 'maintenance'
+     LIMIT 1`
+  );
+
+  return String(
+    row?.value || "0"
+  ) === "1";
+}
+
+
+async function setMaintenance(
+  env,
+  args,
+  employee,
+  chatId
+) {
+  if (
+    !employee ||
+    Number(employee.rank) < 5
+  ) {
+    await sendMessage(
+      chatId,
+      "❌ Недостаточно прав.",
+      env
+    );
+
+    return;
+  }
+
+  const mode =
+    String(args?.[0] || "")
+      .toLowerCase();
+
+  if (
+    mode !== "on" &&
+    mode !== "off"
+  ) {
+    await sendMessage(
+      chatId,
+      "❌ Использование: on или off.",
+      env
+    );
+
+    return;
+  }
+
+  const value =
+    mode === "on"
+      ? "1"
+      : "0";
+
+  await dbRun(
+    env,
+    `INSERT INTO system_settings
+     (
+       key,
+       value,
+       updated_by,
+       updated_at
+     )
+     VALUES (
+       'maintenance',
+       ?,
+       ?,
+       datetime('now')
+     )
+     ON CONFLICT(key)
+     DO UPDATE SET
+       value = excluded.value,
+       updated_by = excluded.updated_by,
+       updated_at = excluded.updated_at`,
+    value,
+    String(employee.telegram_id)
+  );
+
+  await dbRun(
+    env,
+    `INSERT INTO admin_actions
+     (
+       admin_telegram_id,
+       action,
+       details,
+       created_at
+     )
+     VALUES (?, ?, ?, datetime('now'))`,
+    String(employee.telegram_id),
+    mode === "on"
+      ? "maintenance_on"
+      : "maintenance_off",
+    mode === "on"
+      ? "Технический режим включён"
+      : "Технический режим выключен"
+  );
+
+  await sendMessage(
+    chatId,
+    mode === "on"
+      ? "🚧 Технический режим <b>ВКЛЮЧЕН</b>."
+      : "✅ Технический режим <b>ВЫКЛЮЧЕН</b>.",
+    env
+  );
+}
+
+
+/* ============================================================
+   MOSCOW DATE
+   ============================================================ */
+
+function getMoscowDate() {
+  return new Intl.DateTimeFormat(
+    "en-CA",
+    {
+      timeZone: CONFIG.moscowTimezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }
+  ).format(new Date());
+}
+
+
+/* ============================================================
+   TIME FORMAT
+   ============================================================ */
+
+function formatTime(value) {
+  if (!value) return "--:--";
 
   try {
     return new Intl.DateTimeFormat(
       "ru-RU",
       {
-        timeZone:
-          CONFIG.moscowTimezone,
-        day: "2-digit",
-        month: "2-digit",
+        timeZone: CONFIG.moscowTimezone,
         hour: "2-digit",
         minute: "2-digit"
       }
-    ).format(
-      new Date(value)
-    );
+    ).format(new Date(value));
   } catch {
     return "--:--";
   }
 }
 
-function formatMinutes(
-  minutes
-) {
+
+/* ============================================================
+   MINUTES FORMAT
+   ============================================================ */
+
+function formatMinutes(minutes) {
   const total =
     Math.max(
       0,
@@ -4048,9 +5220,7 @@ function formatMinutes(
     );
 
   const hours =
-    Math.floor(
-      total / 60
-    );
+    Math.floor(total / 60);
 
   const mins =
     total % 60;
@@ -4058,17 +5228,55 @@ function formatMinutes(
   return `${hours}ч ${mins}м`;
 }
 
-function getMoscowDate() {
-  return new Intl.DateTimeFormat(
-    "en-CA",
-    {
-      timeZone:
-        CONFIG.moscowTimezone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit"
-    }
-  ).format(
-    new Date()
-  );
+
+/* ============================================================
+   HTML ESCAPE
+   ============================================================ */
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
+
+
+/* ============================================================
+   SAFE NUMBER
+   ============================================================ */
+
+function safeNumber(value, fallback = 0) {
+  const number = Number(value);
+
+  return Number.isFinite(number)
+    ? number
+    : fallback;
+}
+
+
+/* ============================================================
+   SAFE INTEGER
+   ============================================================ */
+
+function safeInteger(value, fallback = 0) {
+  const number =
+    Number.parseInt(
+      value,
+      10
+    );
+
+  return Number.isFinite(number)
+    ? number
+    : fallback;
+}
+
+
+/* ============================================================
+   FINAL
+   ============================================================ */
+
+console.log(
+  "DOXACHKAA UC Worker loaded successfully."
+);
