@@ -1,1 +1,8 @@
+name = "cold-queen-db"
+main = "worker.js"
+compatibility_date = "2026-08-19"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "doxachkaa_uc"
+database_id = "f076e5af-1548-4f78-a237-eb6b456d840a"
