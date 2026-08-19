@@ -4,11 +4,9 @@
  *
  * Cloudflare Workers + Telegram Bot API + D1
  *
- * Секрет:
- *   BOT_TOKEN
- *
- * D1 binding:
- *   DB
+ * Cloudflare:
+ *   Secret: BOT_TOKEN
+ *   D1 Binding: DB
  */
 
 const RANKS = {
@@ -26,23 +24,31 @@ const MODERATOR_ROLE = "moderator";
 export default {
   async fetch(request, env) {
     try {
+      // Проверка Worker через браузер
       if (request.method !== "POST") {
         return new Response("DOXACHKAA UC Worker OK", {
           status: 200,
+          headers: {
+            "Content-Type": "text/plain; charset=UTF-8",
+          },
         });
       }
 
       const update = await request.json();
 
+      // Обычные сообщения Telegram
       if (update.message) {
         await handleMessage(update.message, env);
       }
 
+      // Нажатия inline-кнопок
       if (update.callback_query) {
         await handleCallback(update.callback_query, env);
       }
 
-      return new Response("OK");
+      return new Response("OK", {
+        status: 200,
+      });
     } catch (error) {
       console.error("Worker error:", error);
 
@@ -54,11 +60,16 @@ export default {
 };
 
 /* =========================================================
-   TELEGRAM
+   TELEGRAM API
 ========================================================= */
 
 async function telegram(method, data, env) {
-  const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`;
+  if (!env.BOT_TOKEN) {
+    throw new Error("BOT_TOKEN is not configured");
+  }
+
+  const url =
+    `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`;
 
   const response = await fetch(url, {
     method: "POST",
@@ -68,7 +79,13 @@ async function telegram(method, data, env) {
     body: JSON.stringify(data),
   });
 
-  return response.json();
+  const result = await response.json();
+
+  if (!result.ok) {
+    console.error("Telegram API error:", result);
+  }
+
+  return result;
 }
 
 async function sendMessage(chatId, text, env, options = {}) {
@@ -89,9 +106,10 @@ async function sendMessage(chatId, text, env, options = {}) {
 ========================================================= */
 
 async function handleMessage(message, env) {
-  if (!message.from) return;
+  if (!message || !message.from) {
+    return;
+  }
 
-  const telegramId = String(message.from.id);
   const chatId = message.chat.id;
   const text = (message.text || "").trim();
 
@@ -107,10 +125,15 @@ async function handleMessage(message, env) {
     return;
   }
 
-  // Следующие команды будут добавлены на следующих этапах.
   await sendMessage(
     chatId,
-    "❓ Неизвестная команда.\n\nИспользуйте /start или /me.",
+    [
+      "❓ <b>Неизвестная команда</b>",
+      "",
+      "Используйте:",
+      "/start — начать",
+      "/me — мой профиль",
+    ].join("\n"),
     env
   );
 }
@@ -120,10 +143,9 @@ async function handleMessage(message, env) {
 ========================================================= */
 
 async function handleCallback(callback, env) {
-  if (!callback.from || !callback.message) return;
-
-  const telegramId = String(callback.from.id);
-  const data = callback.data || "";
+  if (!callback || !callback.from || !callback.message) {
+    return;
+  }
 
   await telegram(
     "answerCallbackQuery",
@@ -133,52 +155,54 @@ async function handleCallback(callback, env) {
     env
   );
 
-  const user = await getUser(telegramId, env);
-
-  if (!user) return;
-
-  // Здесь позже будут кнопки админ-панели,
-  // модераторской панели и управления системой.
-
-  if (data === "noop") {
-    return;
-  }
+  // Кнопки будут добавлены на следующих этапах.
 }
 
 /* =========================================================
-   USERS
+   DATABASE — USERS
 ========================================================= */
 
 async function getUser(telegramId, env) {
-  return env.DB.prepare(
-    `
-    SELECT *
-    FROM users
-    WHERE telegram_id = ?
-    LIMIT 1
-    `
-  )
-    .bind(telegramId)
+  if (!env.DB) {
+    throw new Error("D1 binding DB is not configured");
+  }
+
+  return env.DB
+    .prepare(
+      `
+      SELECT *
+      FROM users
+      WHERE telegram_id = ?
+      LIMIT 1
+      `
+    )
+    .bind(String(telegramId))
     .first();
 }
 
 async function getOrCreateUser(from, env) {
+  if (!env.DB) {
+    throw new Error("D1 binding DB is not configured");
+  }
+
   const telegramId = String(from.id);
 
   let user = await getUser(telegramId, env);
 
+  // Пользователь уже существует
   if (user) {
-    await env.DB.prepare(
-      `
-      UPDATE users
-      SET
-        username = ?,
-        first_name = ?,
-        last_name = ?,
-        updated_at = ?
-      WHERE telegram_id = ?
-      `
-    )
+    await env.DB
+      .prepare(
+        `
+        UPDATE users
+        SET
+          username = ?,
+          first_name = ?,
+          last_name = ?,
+          updated_at = ?
+        WHERE telegram_id = ?
+        `
+      )
       .bind(
         from.username || null,
         from.first_name || null,
@@ -188,31 +212,28 @@ async function getOrCreateUser(from, env) {
       )
       .run();
 
-    return {
-      ...user,
-      username: from.username || null,
-      first_name: from.first_name || null,
-      last_name: from.last_name || null,
-    };
+    return await getUser(telegramId, env);
   }
 
-  await env.DB.prepare(
-    `
-    INSERT INTO users (
-      telegram_id,
-      username,
-      first_name,
-      last_name,
-      role,
-      rank,
-      balance,
-      uc,
-      created_at,
-      updated_at
+  // Новый пользователь
+  await env.DB
+    .prepare(
+      `
+      INSERT INTO users (
+        telegram_id,
+        username,
+        first_name,
+        last_name,
+        role,
+        rank,
+        balance,
+        uc,
+        created_at,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `
-  )
     .bind(
       telegramId,
       from.username || null,
@@ -227,9 +248,7 @@ async function getOrCreateUser(from, env) {
     )
     .run();
 
-  user = await getUser(telegramId, env);
-
-  return user;
+  return await getUser(telegramId, env);
 }
 
 /* =========================================================
@@ -242,20 +261,18 @@ async function commandStart(chatId, user, env) {
     user.username ||
     "Игрок";
 
-  await sendMessage(
-    chatId,
-    [
-      `👋 Привет, <b>${escapeHtml(name)}</b>!`,
-      "",
-      "🎰 Добро пожаловать в <b>DOXACHKAA UC</b>.",
-      "",
-      `👤 Роль: <b>${getRoleName(user)}</b>`,
-      `⭐ Ранг: <b>${user.rank}</b>`,
-      "",
-      "Используйте /me для просмотра своего профиля.",
-    ].join("\n"),
-    env
-  );
+  const text = [
+    `👋 Привет, <b>${escapeHtml(name)}</b>!`,
+    "",
+    "🎰 Добро пожаловать в <b>DOXACHKAA UC</b>.",
+    "",
+    `👤 Роль: <b>${escapeHtml(getRoleName(user))}</b>`,
+    `⭐ Ранг: <b>${Number(user.rank)}</b>`,
+    "",
+    "Используйте /me для просмотра своего профиля.",
+  ].join("\n");
+
+  await sendMessage(chatId, text, env);
 }
 
 /* =========================================================
@@ -263,23 +280,21 @@ async function commandStart(chatId, user, env) {
 ========================================================= */
 
 async function commandMe(chatId, user, env) {
-  await sendMessage(
-    chatId,
-    [
-      "👤 <b>Ваш профиль</b>",
-      "",
-      `🆔 Telegram ID: <code>${user.telegram_id}</code>`,
-      `👤 Роль: <b>${getRoleName(user)}</b>`,
-      `⭐ Ранг: <b>${user.rank}</b>`,
-      `💰 Баланс: <b>${formatMoney(user.balance)} ₽</b>`,
-      `💎 UC: <b>${Number(user.uc || 0)}</b>`,
-    ].join("\n"),
-    env
-  );
+  const text = [
+    "👤 <b>Ваш профиль</b>",
+    "",
+    `🆔 Telegram ID: <code>${escapeHtml(user.telegram_id)}</code>`,
+    `👤 Роль: <b>${escapeHtml(getRoleName(user))}</b>`,
+    `⭐ Ранг: <b>${Number(user.rank)}</b>`,
+    `💰 Баланс: <b>${formatMoney(user.balance)} ₽</b>`,
+    `💎 UC: <b>${Number(user.uc || 0)}</b>`,
+  ].join("\n");
+
+  await sendMessage(chatId, text, env);
 }
 
 /* =========================================================
-   ROLES / PERMISSIONS
+   ROLES
 ========================================================= */
 
 function getRoleName(user) {
@@ -287,15 +302,22 @@ function getRoleName(user) {
     return "Модератор";
   }
 
-  return RANKS[user.rank] || "Игрок";
+  return RANKS[Number(user.rank)] || "Игрок";
 }
 
 function isAdmin(user) {
-  return user.role === "admin" && Number(user.rank) >= 1;
+  return (
+    user &&
+    user.role === "admin" &&
+    Number(user.rank) >= 1
+  );
 }
 
 function isModerator(user) {
-  return user.role === MODERATOR_ROLE;
+  return (
+    user &&
+    user.role === MODERATOR_ROLE
+  );
 }
 
 function isAdminOrModerator(user) {
@@ -303,28 +325,24 @@ function isAdminOrModerator(user) {
 }
 
 function isRankAtLeast(user, rank) {
-  return isAdmin(user) && Number(user.rank) >= rank;
+  return (
+    isAdmin(user) &&
+    Number(user.rank) >= Number(rank)
+  );
 }
 
 function isRankBetween(user, min, max) {
-  if (!isAdmin(user)) return false;
+  if (!isAdmin(user)) {
+    return false;
+  }
 
   const rank = Number(user.rank);
 
-  return rank >= min && rank <= max;
+  return (
+    rank >= Number(min) &&
+    rank <= Number(max)
+  );
 }
-
-/*
-  Будущая система прав:
-
-  6 — полный доступ
-  5 — почти полный доступ, но без управления 6
-  4 — права куратора
-  3 — права 3 ранга
-  2 — права 2 ранга
-  1 — права 1 ранга
-  moderator — отдельные права модератора
-*/
 
 /* =========================================================
    TIME
@@ -351,14 +369,14 @@ function formatMoney(value) {
 }
 
 /* =========================================================
-   SECURITY / HTML
+   HTML SECURITY
 ========================================================= */
 
 function escapeHtml(value) {
-  return String(value || "")
+  return String(value ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
-    }
+}
