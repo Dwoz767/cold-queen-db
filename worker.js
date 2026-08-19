@@ -1,6 +1,6 @@
 /**
  * DOXACHKAA UC
- * ЭТАП 3 — АДМИН-ПАНЕЛЬ И УПРАВЛЕНИЕ СОТРУДНИКАМИ
+ * ЭТАП 3 — АДМИН-ПАНЕЛЬ
  *
  * Cloudflare Workers + Telegram Bot API + D1
  *
@@ -21,8 +21,8 @@ const RANKS = {
   6: "Главный Администратор",
 };
 
-const MODERATOR_ROLE = "moderator";
 const ADMIN_ROLE = "admin";
+const MODERATOR_ROLE = "moderator";
 
 const LOGIN_MIN_LENGTH = 4;
 const LOGIN_MAX_LENGTH = 32;
@@ -44,6 +44,8 @@ export default {
 
       const update = await request.json();
 
+      console.log("TELEGRAM UPDATE:", JSON.stringify(update));
+
       if (update.message) {
         await handleMessage(update.message, env);
       }
@@ -54,7 +56,7 @@ export default {
 
       return new Response("OK");
     } catch (error) {
-      console.error("Worker error:", error);
+      console.error("WORKER ERROR:", error);
 
       return new Response("Internal error", {
         status: 500,
@@ -85,9 +87,7 @@ async function telegram(method, data, env) {
 
   const result = await response.json();
 
-  if (!result.ok) {
-    console.error("Telegram API error:", result);
-  }
+  console.log("TELEGRAM API:", method, result);
 
   return result;
 }
@@ -117,49 +117,109 @@ async function handleMessage(message, env) {
   const chatId = message.chat.id;
   const text = (message.text || "").trim();
 
-  const user = await getOrCreateUser(message.from, env);
+  console.log("TELEGRAM MESSAGE:", {
+    chatId,
+    telegramId: message.from.id,
+    text,
+  });
 
+  const user = await getOrCreateUser(
+    message.from,
+    env
+  );
+
+  console.log("USER:", {
+    telegramId: user.telegram_id,
+    role: user.role,
+    rank: user.rank,
+    admin_login: user.admin_login,
+  });
+
+  /*
+   * Первичная установка пароля для Главного Администратора.
+   */
+  if (text === "/setadminpassword") {
+    await startSetAdminPassword(
+      chatId,
+      user,
+      env
+    );
+    return;
+  }
+
+  /*
+   * Вход в админ-панель.
+   */
   if (text === "/alogin") {
-    await startAdminLogin(chatId, user, env);
+    await startAdminLogin(
+      chatId,
+      user,
+      env
+    );
     return;
   }
 
+  /*
+   * Выход.
+   */
   if (text === "/alogout") {
-    await logoutPanel(chatId, user, env);
+    await logoutPanel(
+      chatId,
+      user,
+      env
+    );
     return;
   }
 
-  if (text === "/hlogin") {
-    await startModeratorLogin(chatId, user, env);
+  /*
+   * Панель.
+   */
+  if (text === "/panel") {
+    if (await isPanelLoggedIn(user, env)) {
+      await showAdminPanel(
+        chatId,
+        user,
+        env
+      );
+    } else {
+      await sendMessage(
+        chatId,
+        "⛔ Вы не авторизованы.\n\nИспользуйте /alogin.",
+        env
+      );
+    }
+
     return;
   }
 
-  if (await handlePanelInput(message, user, env)) {
+  /*
+   * Сначала обрабатываем временное состояние.
+   */
+  if (
+    await handlePanelInput(
+      message,
+      user,
+      env
+    )
+  ) {
     return;
   }
 
   if (text === "/start") {
-    await commandStart(chatId, user, env);
+    await commandStart(
+      chatId,
+      user,
+      env
+    );
     return;
   }
 
   if (text === "/me") {
-    await commandMe(chatId, user, env);
-    return;
-  }
-
-  if (text === "/panel") {
-    if (await isPanelLoggedIn(user, env)) {
-      await showAdminPanel(chatId, user, env);
-      return;
-    }
-
-    await sendMessage(
+    await commandMe(
       chatId,
-      "⛔ Вы не авторизованы в панели.\n\nИспользуйте /alogin.",
+      user,
       env
     );
-
     return;
   }
 
@@ -172,6 +232,7 @@ async function handleMessage(message, env) {
       "/start",
       "/me",
       "/alogin",
+      "/panel",
       "/alogout",
     ].join("\n"),
     env
@@ -179,16 +240,46 @@ async function handleMessage(message, env) {
 }
 
 /* =========================================================
-   LOGIN
+   ADMIN LOGIN
 ========================================================= */
 
-async function startAdminLogin(chatId, user, env) {
+async function startAdminLogin(
+  chatId,
+  user,
+  env
+) {
   if (!isAdmin(user)) {
     await sendMessage(
       chatId,
       "⛔ <b>Доступ запрещён.</b>\n\nУ вас нет доступа к админ-панели.",
       env
     );
+
+    return;
+  }
+
+  if (!user.admin_login) {
+    await sendMessage(
+      chatId,
+      "❌ Для вашего аккаунта не установлен админ-логин.",
+      env
+    );
+
+    return;
+  }
+
+  if (!user.admin_password_hash) {
+    await sendMessage(
+      chatId,
+      [
+        "⚠️ <b>Пароль ещё не установлен.</b>",
+        "",
+        "Используйте:",
+        "<code>/setadminpassword</code>",
+      ].join("\n"),
+      env
+    );
+
     return;
   }
 
@@ -211,34 +302,70 @@ async function startAdminLogin(chatId, user, env) {
       "",
       "Введите ваш логин.",
       "",
-      "Логин должен содержать только латинские буквы и цифры.",
+      "Логин:",
+      "• только латинские буквы и цифры",
+      `• ${LOGIN_MIN_LENGTH}-${LOGIN_MAX_LENGTH} символов`,
     ].join("\n"),
     env
   );
 }
 
-async function startModeratorLogin(chatId, user, env) {
-  if (!isModerator(user)) {
+/* =========================================================
+   SET ADMIN PASSWORD
+========================================================= */
+
+async function startSetAdminPassword(
+  chatId,
+  user,
+  env
+) {
+  /*
+   * На данном этапе пароль может установить
+   * только Главный Администратор 6 ранга.
+   */
+  if (
+    !isAdmin(user) ||
+    Number(user.rank) !== 6
+  ) {
     await sendMessage(
       chatId,
-      "⛔ <b>Доступ запрещён.</b>\n\nУ вас нет доступа к панели модератора.",
+      "⛔ Только Главный Администратор 6 ранга может установить пароль.",
       env
     );
+
+    return;
+  }
+
+  if (!user.admin_login) {
+    await sendMessage(
+      chatId,
+      "❌ У вашего аккаунта отсутствует admin_login.",
+      env
+    );
+
     return;
   }
 
   await setPanelState(
     user.telegram_id,
-    "moderator_login",
+    "set_password",
     env
   );
 
   await sendMessage(
     chatId,
     [
-      "🛡️ <b>Вход в панель модератора</b>",
+      "🔑 <b>Установка пароля</b>",
       "",
-      "Введите логин.",
+      `Логин: <code>${escapeHtml(
+        user.admin_login
+      )}</code>`,
+      "",
+      "Введите новый пароль.",
+      "",
+      "Требования:",
+      "• только цифры",
+      `• ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH} цифр`,
     ].join("\n"),
     env
   );
@@ -248,7 +375,11 @@ async function startModeratorLogin(chatId, user, env) {
    PANEL INPUT
 ========================================================= */
 
-async function handlePanelInput(message, user, env) {
+async function handlePanelInput(
+  message,
+  user,
+  env
+) {
   if (!message.text) {
     return false;
   }
@@ -264,8 +395,80 @@ async function handlePanelInput(message, user, env) {
 
   const text = message.text.trim();
 
-  /* ---------- ADMIN LOGIN ---------- */
+  console.log("PANEL INPUT:", {
+    telegramId: user.telegram_id,
+    state,
+  });
 
+  /*
+   * Установка нового пароля.
+   */
+  if (state === "set_password") {
+    if (!isValidPassword(text)) {
+      await sendMessage(
+        message.chat.id,
+        [
+          "❌ <b>Неверный пароль.</b>",
+          "",
+          "Используйте только цифры.",
+          `Длина: ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH} цифр.`,
+        ].join("\n"),
+        env
+      );
+
+      return true;
+    }
+
+    const passwordHash =
+      await hashPassword(text);
+
+    await env.DB
+      .prepare(
+        `
+        UPDATE users
+        SET
+          admin_password_hash = ?,
+          updated_at = ?
+        WHERE telegram_id = ?
+        `
+      )
+      .bind(
+        passwordHash,
+        now(),
+        user.telegram_id
+      )
+      .run();
+
+    await clearPanelState(
+      user.telegram_id,
+      env
+    );
+
+    await sendMessage(
+      message.chat.id,
+      [
+        "✅ <b>Пароль успешно установлен.</b>",
+        "",
+        `Логин: <code>${escapeHtml(
+          user.admin_login
+        )}</code>`,
+        "",
+        "Теперь используйте /alogin для входа.",
+      ].join("\n"),
+      env
+    );
+
+    console.log(
+      "ADMIN PASSWORD SET:",
+      user.telegram_id
+    );
+
+    return true;
+  }
+
+  /*
+   * Ввод логина.
+   */
   if (state === "login") {
     if (!isValidLogin(text)) {
       await sendMessage(
@@ -299,7 +502,7 @@ async function handlePanelInput(message, user, env) {
       [
         "🔒 <b>Введите пароль</b>",
         "",
-        "Пароль должен содержать только цифры.",
+        "Используйте только цифры.",
       ].join("\n"),
       env
     );
@@ -307,8 +510,9 @@ async function handlePanelInput(message, user, env) {
     return true;
   }
 
-  /* ---------- ADMIN PASSWORD ---------- */
-
+  /*
+   * Ввод пароля.
+   */
   if (state === "password") {
     if (!isValidPassword(text)) {
       await sendMessage(
@@ -325,10 +529,11 @@ async function handlePanelInput(message, user, env) {
       return true;
     }
 
-    const login = await getPanelTempLogin(
-      user.telegram_id,
-      env
-    );
+    const login =
+      await getPanelTempLogin(
+        user.telegram_id,
+        env
+      );
 
     if (!login) {
       await clearPanelState(
@@ -345,19 +550,21 @@ async function handlePanelInput(message, user, env) {
       return true;
     }
 
-    const passwordHash = await hashPassword(text);
+    const passwordHash =
+      await hashPassword(text);
 
-    const employee = await env.DB
-      .prepare(
-        `
-        SELECT *
-        FROM users
-        WHERE admin_login = ?
-        LIMIT 1
-        `
-      )
-      .bind(login)
-      .first();
+    const employee =
+      await env.DB
+        .prepare(
+          `
+          SELECT *
+          FROM users
+          WHERE admin_login = ?
+          LIMIT 1
+          `
+        )
+        .bind(login)
+        .first();
 
     if (
       !employee ||
@@ -379,6 +586,12 @@ async function handlePanelInput(message, user, env) {
         message.chat.id,
         "❌ <b>Неверный логин или пароль.</b>",
         env
+      );
+
+      console.log(
+        "LOGIN FAILED:",
+        user.telegram_id,
+        login
       );
 
       return true;
@@ -440,9 +653,15 @@ async function handlePanelInput(message, user, env) {
       env
     );
 
-    const freshUser = await getUser(
-      user.telegram_id,
-      env
+    const freshUser =
+      await getUser(
+        user.telegram_id,
+        env
+      );
+
+    console.log(
+      "LOGIN SUCCESS:",
+      user.telegram_id
     );
 
     await showAdminPanel(
@@ -454,414 +673,18 @@ async function handlePanelInput(message, user, env) {
     return true;
   }
 
-  /* ---------- CREATE EMPLOYEE ---------- */
-
-  if (state === "create_type") {
-    const type = text.toLowerCase();
-
-    if (
-      type !== "admin" &&
-      type !== "moderator"
-    ) {
-      await sendMessage(
-        message.chat.id,
-        [
-          "❌ Неверный тип.",
-          "",
-          "Напишите:",
-          "<code>admin</code>",
-          "или",
-          "<code>moderator</code>",
-        ].join("\n"),
-        env
-      );
-
-      return true;
-    }
-
-    if (
-      type === "admin" &&
-      Number(user.rank) !== 6
-    ) {
-      await sendMessage(
-        message.chat.id,
-        "⛔ Только Главный Администратор 6 ранга может создавать администраторов.",
-        env
-      );
-
-      await clearPanelState(
-        user.telegram_id,
-        env
-      );
-
-      return true;
-    }
-
-    await setPanelState(
-      user.telegram_id,
-      `create_rank:${type}`,
-      env
-    );
-
-    await sendMessage(
-      message.chat.id,
-      [
-        "⭐ <b>Выберите ранг сотрудника</b>",
-        "",
-        type === "admin"
-          ? "Доступные ранги: 1–6"
-          : "Модератор: ранг 0",
-        "",
-        type === "admin"
-          ? "Введите число от <b>1</b> до <b>6</b>."
-          : "Введите <b>0</b>.",
-      ].join("\n"),
-      env
-    );
-
-    return true;
-  }
-
-  /* ---------- CREATE RANK ---------- */
-
-  if (state.startsWith("create_rank:")) {
-    const type = state.split(":")[1];
-    const rank = Number(text);
-
-    if (!Number.isInteger(rank)) {
-      await sendMessage(
-        message.chat.id,
-        "❌ Ранг должен быть числом.",
-        env
-      );
-
-      return true;
-    }
-
-    if (
-      type === "admin" &&
-      (rank < 1 || rank > 6)
-    ) {
-      await sendMessage(
-        message.chat.id,
-        "❌ Для администратора можно выбрать ранг от 1 до 6.",
-        env
-      );
-
-      return true;
-    }
-
-    if (
-      type === "moderator" &&
-      rank !== 0
-    ) {
-      await sendMessage(
-        message.chat.id,
-        "❌ Для модератора используется ранг 0.",
-        env
-      );
-
-      return true;
-    }
-
-    if (
-      type === "admin" &&
-      Number(user.rank) !== 6
-    ) {
-      await sendMessage(
-        message.chat.id,
-        "⛔ Создавать администраторов может только 6 ранг.",
-        env
-      );
-
-      await clearPanelState(
-        user.telegram_id,
-        env
-      );
-
-      return true;
-    }
-
-    await setPanelState(
-      user.telegram_id,
-      `create_telegram:${type}:${rank}`,
-      env
-    );
-
-    await sendMessage(
-      message.chat.id,
-      [
-        "🆔 <b>Введите Telegram ID сотрудника</b>",
-        "",
-        "Например:",
-        "<code>123456789</code>",
-      ].join("\n"),
-      env
-    );
-
-    return true;
-  }
-
-  /* ---------- CREATE TELEGRAM ID ---------- */
-
-  if (state.startsWith("create_telegram:")) {
-    const parts = state.split(":");
-    const type = parts[1];
-    const rank = Number(parts[2]);
-
-    if (!/^[0-9]+$/.test(text)) {
-      await sendMessage(
-        message.chat.id,
-        "❌ Telegram ID должен содержать только цифры.",
-        env
-      );
-
-      return true;
-    }
-
-    const targetTelegramId = String(text);
-
-    const existing = await getUser(
-      targetTelegramId,
-      env
-    );
-
-    if (existing) {
-      await sendMessage(
-        message.chat.id,
-        "❌ Пользователь с таким Telegram ID уже есть в базе.",
-        env
-      );
-
-      return true;
-    }
-
-    await setPanelState(
-      user.telegram_id,
-      `create_login:${type}:${rank}:${targetTelegramId}`,
-      env
-    );
-
-    if (type === "moderator") {
-      await sendMessage(
-        message.chat.id,
-        [
-          "🛡️ <b>Введите логин модератора</b>",
-          "",
-          "Латинские буквы и цифры.",
-          `Длина: ${LOGIN_MIN_LENGTH}-${LOGIN_MAX_LENGTH}.`,
-        ].join("\n"),
-        env
-      );
-    } else {
-      await sendMessage(
-        message.chat.id,
-        [
-          "👤 <b>Введите логин администратора</b>",
-          "",
-          "Латинские буквы и цифры.",
-          `Длина: ${LOGIN_MIN_LENGTH}-${LOGIN_MAX_LENGTH}.`,
-        ].join("\n"),
-        env
-      );
-    }
-
-    return true;
-  }
-
-  /* ---------- CREATE LOGIN ---------- */
-
-  if (state.startsWith("create_login:")) {
-    const parts = state.split(":");
-
-    const type = parts[1];
-    const rank = Number(parts[2]);
-    const targetTelegramId = parts[3];
-
-    if (!isValidLogin(text)) {
-      await sendMessage(
-        message.chat.id,
-        [
-          "❌ Неверный логин.",
-          "",
-          `Длина: ${LOGIN_MIN_LENGTH}-${LOGIN_MAX_LENGTH}.`,
-          "Только латинские буквы и цифры.",
-        ].join("\n"),
-        env
-      );
-
-      return true;
-    }
-
-    const loginExists = await env.DB
-      .prepare(
-        `
-        SELECT id
-        FROM users
-        WHERE admin_login = ?
-        LIMIT 1
-        `
-      )
-      .bind(text)
-      .first();
-
-    if (loginExists) {
-      await sendMessage(
-        message.chat.id,
-        "❌ Такой логин уже занят. Введите другой логин.",
-        env
-      );
-
-      return true;
-    }
-
-    await setPanelState(
-      user.telegram_id,
-      `create_password:${type}:${rank}:${targetTelegramId}:${text}`,
-      env
-    );
-
-    await sendMessage(
-      message.chat.id,
-      [
-        "🔑 <b>Введите пароль сотрудника</b>",
-        "",
-        "Только цифры.",
-        `Длина: ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH}.`,
-      ].join("\n"),
-      env
-    );
-
-    return true;
-  }
-
-  /* ---------- CREATE PASSWORD ---------- */
-
-  if (state.startsWith("create_password:")) {
-    const parts = state.split(":");
-
-    const type = parts[1];
-    const rank = Number(parts[2]);
-    const targetTelegramId = parts[3];
-    const login = parts[4];
-
-    if (!isValidPassword(text)) {
-      await sendMessage(
-        message.chat.id,
-        [
-          "❌ Неверный пароль.",
-          "",
-          "Пароль должен содержать только цифры.",
-          `Длина: ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH}.`,
-        ].join("\n"),
-        env
-      );
-
-      return true;
-    }
-
-    const passwordHash = await hashPassword(text);
-
-    await env.DB
-      .prepare(
-        `
-        INSERT INTO users (
-          telegram_id,
-          username,
-          first_name,
-          last_name,
-          role,
-          rank,
-          balance,
-          uc,
-          created_at,
-          updated_at,
-          admin_login,
-          admin_password_hash,
-          panel_session,
-          panel_status,
-          panel_last_activity,
-          last_login_at
-        )
-        VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, 0, 'offline', NULL, NULL
-        )
-        `
-      )
-      .bind(
-        targetTelegramId,
-        null,
-        null,
-        null,
-        type === "admin"
-          ? ADMIN_ROLE
-          : MODERATOR_ROLE,
-        rank,
-        0,
-        0,
-        now(),
-        now(),
-        login,
-        passwordHash
-      )
-      .run();
-
-    await clearPanelState(
-      user.telegram_id,
-      env
-    );
-
-    await sendMessage(
-      message.chat.id,
-      [
-        "✅ <b>Сотрудник создан!</b>",
-        "",
-        `🆔 Telegram ID: <code>${escapeHtml(
-          targetTelegramId
-        )}</code>`,
-        `👤 Тип: <b>${
-          type === "admin"
-            ? "Администратор"
-            : "Модератор"
-        }</b>`,
-        `⭐ Ранг: <b>${rank}</b>`,
-        `🔑 Логин: <code>${escapeHtml(
-          login
-        )}</code>`,
-        "",
-        "Данные сохранены в D1.",
-      ].join("\n"),
-      env
-    );
-
-    return true;
-  }
-
-  /* ---------- MODERATOR LOGIN ---------- */
-
-  if (state === "moderator_login") {
-    await sendMessage(
-      message.chat.id,
-      "🛡️ Авторизация модераторов будет подключена следующим этапом.",
-      env
-    );
-
-    await clearPanelState(
-      user.telegram_id,
-      env
-    );
-
-    return true;
-  }
-
   return false;
-          }
+}
+
 /* =========================================================
    ADMIN PANEL
 ========================================================= */
 
-async function showAdminPanel(chatId, user, env) {
+async function showAdminPanel(
+  chatId,
+  user,
+  env
+) {
   await updatePanelActivity(
     user.telegram_id,
     env
@@ -922,7 +745,9 @@ async function showAdminPanel(chatId, user, env) {
         user.username ||
         "Сотрудник"
       )}`,
-      `⭐ Ранг: <b>${Number(user.rank)}</b> — ${escapeHtml(
+      `⭐ Ранг: <b>${Number(
+        user.rank
+      )}</b> — ${escapeHtml(
         getRoleName(user)
       )}`,
       "🟢 Статус: <b>Онлайн</b>",
@@ -940,7 +765,6 @@ async function showAdminPanel(chatId, user, env) {
     }
   );
 }
-
 /* =========================================================
    CALLBACK HANDLER
 ========================================================= */
@@ -950,6 +774,12 @@ async function handleCallback(callback, env) {
     return;
   }
 
+  console.log("CALLBACK:", {
+    id: callback.id,
+    from: callback.from.id,
+    data: callback.data,
+  });
+
   await telegram(
     "answerCallbackQuery",
     {
@@ -958,22 +788,28 @@ async function handleCallback(callback, env) {
     env
   );
 
-  const telegramId = String(
-    callback.from.id
-  );
+  const telegramId =
+    String(callback.from.id);
 
-  const user = await getUser(
-    telegramId,
-    env
-  );
+  const user =
+    await getUser(
+      telegramId,
+      env
+    );
 
   if (!user) {
     return;
   }
 
-  const data = callback.data || "";
+  const data =
+    callback.data || "";
 
-  if (!await isPanelLoggedIn(user, env)) {
+  if (
+    !await isPanelLoggedIn(
+      user,
+      env
+    )
+  ) {
     await sendMessage(
       callback.message.chat.id,
       "⛔ Сессия панели закончилась.\n\nВведите /alogin.",
@@ -1048,16 +884,6 @@ async function handleCallback(callback, env) {
     return;
   }
 
-  if (data === "back_employees") {
-    await showEmployeesMenu(
-      callback.message.chat.id,
-      user,
-      env
-    );
-
-    return;
-  }
-
   if (
     data === "search_player" ||
     data === "payments" ||
@@ -1075,10 +901,14 @@ async function handleCallback(callback, env) {
 }
 
 /* =========================================================
-   EMPLOYEES
+   EMPLOYEES MENU
 ========================================================= */
 
-async function showEmployeesMenu(chatId, user, env) {
+async function showEmployeesMenu(
+  chatId,
+  user,
+  env
+) {
   if (!canManageEmployees(user)) {
     await sendMessage(
       chatId,
@@ -1089,16 +919,19 @@ async function showEmployeesMenu(chatId, user, env) {
     return;
   }
 
+  const rank =
+    Number(user.rank);
+
   await sendMessage(
     chatId,
     [
       "👥 <b>Управление сотрудниками</b>",
       "",
-      `Ваш ранг: <b>${Number(user.rank)}</b>`,
+      `Ваш ранг: <b>${rank}</b>`,
       "",
-      Number(user.rank) === 6
+      rank === 6
         ? "✅ Вы можете создавать сотрудников рангов 1–6."
-        : "✅ У вас ограниченный доступ.",
+        : "✅ Вы можете создавать сотрудников рангов 1–5.",
       "",
       "Выберите действие:",
     ].join("\n"),
@@ -1109,19 +942,22 @@ async function showEmployeesMenu(chatId, user, env) {
           [
             {
               text: "➕ Создать сотрудника",
-              callback_data: "create_employee",
+              callback_data:
+                "create_employee",
             },
           ],
           [
             {
               text: "📋 Список сотрудников",
-              callback_data: "employee_list",
+              callback_data:
+                "employee_list",
             },
           ],
           [
             {
               text: "⬅️ Назад",
-              callback_data: "back_panel",
+              callback_data:
+                "back_panel",
             },
           ],
         ],
@@ -1130,21 +966,19 @@ async function showEmployeesMenu(chatId, user, env) {
   );
 }
 
-async function startCreateEmployee(chatId, user, env) {
+/* =========================================================
+   CREATE EMPLOYEE
+========================================================= */
+
+async function startCreateEmployee(
+  chatId,
+  user,
+  env
+) {
   if (!canManageEmployees(user)) {
     await sendMessage(
       chatId,
       "⛔ Доступ запрещён.",
-      env
-    );
-
-    return;
-  }
-
-  if (Number(user.rank) !== 6) {
-    await sendMessage(
-      chatId,
-      "⛔ Создание сотрудников сейчас доступно только Главному Администратору 6 ранга.",
       env
     );
 
@@ -1166,6 +1000,8 @@ async function startCreateEmployee(chatId, user, env) {
       "",
       "<code>admin</code> — администратор",
       "<code>moderator</code> — модератор",
+      "",
+      "Для отмены: <code>/cancel</code>",
     ].join("\n"),
     env
   );
@@ -1175,40 +1011,46 @@ async function startCreateEmployee(chatId, user, env) {
    EMPLOYEE LIST
 ========================================================= */
 
-async function showEmployeeList(chatId, user, env) {
+async function showEmployeeList(
+  chatId,
+  user,
+  env
+) {
   if (!canManageEmployees(user)) {
     await sendMessage(
       chatId,
-      "⛔ У вас нет доступа.",
+      "⛔ Доступ запрещён.",
       env
     );
 
     return;
   }
 
-  const result = await env.DB
-    .prepare(
-      `
-      SELECT
-        id,
-        telegram_id,
-        username,
-        first_name,
-        last_name,
-        role,
-        rank,
-        admin_login,
-        panel_status,
-        last_login_at
-      FROM users
-      WHERE role = 'admin'
-         OR role = 'moderator'
-      ORDER BY rank DESC, id ASC
-      `
-    )
-    .all();
+  const result =
+    await env.DB
+      .prepare(
+        `
+        SELECT
+          id,
+          telegram_id,
+          username,
+          first_name,
+          last_name,
+          role,
+          rank,
+          admin_login,
+          panel_status,
+          last_login_at
+        FROM users
+        WHERE role = 'admin'
+           OR role = 'moderator'
+        ORDER BY rank DESC, id ASC
+        `
+      )
+      .all();
 
-  const rows = result.results || [];
+  const rows =
+    result.results || [];
 
   if (rows.length === 0) {
     await sendMessage(
@@ -1239,20 +1081,23 @@ async function showEmployeeList(chatId, user, env) {
     lines.push(
       `${getStatusEmoji(
         employee.panel_status
-      )} <b>${escapeHtml(name)}</b>`,
+      )} <b>${escapeHtml(
+        name
+      )}</b>`,
       `🆔 <code>${escapeHtml(
         employee.telegram_id
       )}</code>`,
       `👤 ${role}`,
-      `⭐ Ранг: <b>${Number(employee.rank)}</b>`,
-      `🔑 Логин: <code>${escapeHtml(
-        employee.admin_login || "—"
-      )}</code>`,
-      `📌 ${escapeHtml(
-        getStatusName(
-          employee.panel_status
-        )
+      `⭐ Ранг: ${Number(
+        employee.rank
       )}`,
+      `🔑 Логин: ${
+        employee.admin_login
+          ? `<code>${escapeHtml(
+              employee.admin_login
+            )}</code>`
+          : "—"
+      }`,
       ""
     );
   }
@@ -1267,7 +1112,8 @@ async function showEmployeeList(chatId, user, env) {
           [
             {
               text: "⬅️ Назад",
-              callback_data: "employees",
+              callback_data:
+                "employees",
             },
           ],
         ],
@@ -1280,29 +1126,35 @@ async function showEmployeeList(chatId, user, env) {
    ACTIVITY
 ========================================================= */
 
-async function showActivity(chatId, user, env) {
-  const employees = await env.DB
-    .prepare(
-      `
-      SELECT
-        telegram_id,
-        username,
-        first_name,
-        last_name,
-        role,
-        rank,
-        panel_status,
-        panel_last_activity,
-        last_login_at
-      FROM users
-      WHERE role = 'admin'
-         OR role = 'moderator'
-      ORDER BY rank DESC
-      `
-    )
-    .all();
+async function showActivity(
+  chatId,
+  user,
+  env
+) {
+  const result =
+    await env.DB
+      .prepare(
+        `
+        SELECT
+          telegram_id,
+          username,
+          first_name,
+          last_name,
+          role,
+          rank,
+          panel_status,
+          panel_last_activity,
+          last_login_at
+        FROM users
+        WHERE role = 'admin'
+           OR role = 'moderator'
+        ORDER BY rank DESC
+        `
+      )
+      .all();
 
-  const rows = employees.results || [];
+  const rows =
+    result.results || [];
 
   if (rows.length === 0) {
     await sendMessage(
@@ -1328,11 +1180,12 @@ async function showActivity(chatId, user, env) {
     lines.push(
       `${getStatusEmoji(
         employee.panel_status
-      )} <b>${escapeHtml(name)}</b>`,
-      `🆔 <code>${escapeHtml(
-        employee.telegram_id
-      )}</code>`,
-      `⭐ Ранг: ${Number(employee.rank)}`,
+      )} <b>${escapeHtml(
+        name
+      )}</b>`,
+      `⭐ Ранг: ${Number(
+        employee.rank
+      )}`,
       `📌 Статус: ${escapeHtml(
         getStatusName(
           employee.panel_status
@@ -1360,7 +1213,8 @@ async function showActivity(chatId, user, env) {
           [
             {
               text: "⬅️ Назад",
-              callback_data: "back_panel",
+              callback_data:
+                "employees",
             },
           ],
         ],
@@ -1370,253 +1224,406 @@ async function showActivity(chatId, user, env) {
 }
 
 /* =========================================================
-   USER / DATABASE
+   CREATE EMPLOYEE INPUT
 ========================================================= */
 
-async function getUser(telegramId, env) {
-  return env.DB
-    .prepare(
-      `
-      SELECT *
-      FROM users
-      WHERE telegram_id = ?
-      LIMIT 1
-      `
-    )
-    .bind(String(telegramId))
-    .first();
-}
-
-async function getOrCreateUser(from, env) {
-  const telegramId = String(from.id);
-
-  let user = await getUser(
-    telegramId,
-    env
-  );
-
-  if (user) {
-    await env.DB
-      .prepare(
-        `
-        UPDATE users
-        SET
-          username = ?,
-          first_name = ?,
-          last_name = ?,
-          updated_at = ?
-        WHERE telegram_id = ?
-        `
-      )
-      .bind(
-        from.username || null,
-        from.first_name || null,
-        from.last_name || null,
-        now(),
-        telegramId
-      )
-      .run();
-
-    return await getUser(
-      telegramId,
+async function handleEmployeeCreationInput(
+  message,
+  user,
+  env
+) {
+  const state =
+    await getPanelState(
+      user.telegram_id,
       env
     );
-  }
 
-  await env.DB
-    .prepare(
-      `
-      INSERT INTO users (
-        telegram_id,
-        username,
-        first_name,
-        last_name,
-        role,
-        rank,
-        balance,
-        uc,
-        created_at,
-        updated_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `
-    )
-    .bind(
-      telegramId,
-      from.username || null,
-      from.first_name || null,
-      from.last_name || null,
-      "player",
-      0,
-      0,
-      0,
-      now(),
-      now()
-    )
-    .run();
-
-  return await getUser(
-    telegramId,
-    env
-  );
-}
-/* =========================================================
-   START
-========================================================= */
-
-async function commandStart(chatId, user, env) {
-  const name =
-    user.first_name ||
-    user.username ||
-    "Игрок";
-
-  await sendMessage(
-    chatId,
-    [
-      `👋 Привет, <b>${escapeHtml(name)}</b>!`,
-      "",
-      "🎰 Добро пожаловать в <b>DOXACHKAA UC</b>.",
-      "",
-      `👤 Роль: <b>${escapeHtml(
-        getRoleName(user)
-      )}</b>`,
-      `⭐ Ранг: <b>${Number(user.rank)}</b>`,
-      "",
-      "Используйте /me для просмотра своего профиля.",
-    ].join("\n"),
-    env
-  );
-}
-
-/* =========================================================
-   ME
-========================================================= */
-
-async function commandMe(chatId, user, env) {
-  await sendMessage(
-    chatId,
-    [
-      "👤 <b>Ваш профиль</b>",
-      "",
-      `🆔 Telegram ID: <code>${escapeHtml(
-        user.telegram_id
-      )}</code>`,
-      `👤 Роль: <b>${escapeHtml(
-        getRoleName(user)
-      )}</b>`,
-      `⭐ Ранг: <b>${Number(user.rank)}</b>`,
-      `💰 Баланс: <b>${formatMoney(
-        user.balance
-      )} ₽</b>`,
-      `💎 UC: <b>${Number(
-        user.uc || 0
-      )}</b>`,
-    ].join("\n"),
-    env
-  );
-}
-
-/* =========================================================
-   LOGOUT
-========================================================= */
-
-async function logoutPanel(chatId, user, env) {
-  await env.DB
-    .prepare(
-      `
-      UPDATE users
-      SET
-        panel_session = 0,
-        panel_status = 'offline',
-        panel_last_activity = ?,
-        updated_at = ?
-      WHERE telegram_id = ?
-      `
-    )
-    .bind(
-      now(),
-      now(),
-      user.telegram_id
-    )
-    .run();
-
-  await clearPanelState(
-    user.telegram_id,
-    env
-  );
-
-  await savePanelTempLogin(
-    user.telegram_id,
-    null,
-    env
-  );
-
-  await sendMessage(
-    chatId,
-    [
-      "🚪 <b>Вы вышли из панели.</b>",
-      "",
-      "Для повторного входа используйте /alogin.",
-    ].join("\n"),
-    env
-  );
-}
-
-/* =========================================================
-   PANEL SESSION
-========================================================= */
-
-async function isPanelLoggedIn(user, env) {
-  const freshUser = await getUser(
-    user.telegram_id,
-    env
-  );
-
-  if (!freshUser) {
+  if (!state) {
     return false;
   }
 
-  return (
-    Number(freshUser.panel_session || 0) === 1
-  );
-}
+  const text =
+    (message.text || "").trim();
 
-async function updatePanelActivity(
-  telegramId,
-  env
-) {
-  await env.DB
-    .prepare(
-      `
-      UPDATE users
-      SET
-        panel_status = 'online',
-        panel_last_activity = ?,
-        updated_at = ?
-      WHERE telegram_id = ?
-        AND panel_session = 1
-      `
-    )
-    .bind(
-      now(),
-      now(),
-      telegramId
-    )
-    .run();
-}
+  /*
+   * Отмена.
+   */
+  if (text === "/cancel") {
+    await clearPanelState(
+      user.telegram_id,
+      env
+    );
 
+    await sendMessage(
+      message.chat.id,
+      "❌ Создание сотрудника отменено.",
+      env
+    );
+
+    return true;
+  }
+
+  /*
+   * Тип сотрудника.
+   */
+  if (state === "create_type") {
+    const type =
+      text.toLowerCase();
+
+    if (
+      type !== ADMIN_ROLE &&
+      type !== MODERATOR_ROLE
+    ) {
+      await sendMessage(
+        message.chat.id,
+        [
+          "❌ Неверный тип.",
+          "",
+          "Введите:",
+          "<code>admin</code>",
+          "или",
+          "<code>moderator</code>",
+        ].join("\n"),
+        env
+      );
+
+      return true;
+    }
+
+    await setPanelState(
+      user.telegram_id,
+      type === ADMIN_ROLE
+        ? "create_admin_telegram"
+        : "create_moderator_telegram",
+      env
+    );
+
+    await sendMessage(
+      message.chat.id,
+      [
+        "🆔 <b>Telegram ID сотрудника</b>",
+        "",
+        "Введите Telegram ID.",
+        "",
+        "Пример:",
+        "<code>123456789</code>",
+      ].join("\n"),
+      env
+    );
+
+    return true;
+  }
+
+  /*
+   * Telegram ID администратора.
+   */
+  if (
+    state === "create_admin_telegram"
+  ) {
+    if (!/^\d+$/.test(text)) {
+      await sendMessage(
+        message.chat.id,
+        "❌ Telegram ID должен содержать только цифры.",
+        env
+      );
+
+      return true;
+    }
+
+    const targetId =
+      String(text);
+
+    const existing =
+      await getUser(
+        targetId,
+        env
+      );
+
+    if (existing) {
+      await sendMessage(
+        message.chat.id,
+        "❌ Пользователь с таким Telegram ID уже существует.",
+        env
+      );
+
+      await clearPanelState(
+        user.telegram_id,
+        env
+      );
+
+      return true;
+    }
+
+    await savePanelTempLogin(
+      user.telegram_id,
+      targetId,
+      env
+    );
+
+    await setPanelState(
+      user.telegram_id,
+      "create_admin_rank",
+      env
+    );
+
+    const maxRank =
+      Number(user.rank) === 6
+        ? 6
+        : 5;
+
+    await sendMessage(
+      message.chat.id,
+      [
+        "⭐ <b>Ранг нового администратора</b>",
+        "",
+        `Введите ранг от 1 до ${maxRank}.`,
+        "",
+        "Например:",
+        "<code>1</code>",
+        "",
+        Number(user.rank) === 6
+          ? "👑 Вы можете создать Главного Администратора 6 ранга."
+          : "⚠️ Ранг 6 для вас недоступен.",
+      ].join("\n"),
+      env
+    );
+
+    return true;
+  }
+
+  /*
+   * Ранг нового администратора.
+   */
+  if (
+    state === "create_admin_rank"
+  ) {
+    if (!/^\d+$/.test(text)) {
+      await sendMessage(
+        message.chat.id,
+        "❌ Ранг должен быть числом.",
+        env
+      );
+
+      return true;
+    }
+
+    const rank =
+      Number(text);
+
+    const maxRank =
+      Number(user.rank) === 6
+        ? 6
+        : 5;
+
+    if (
+      rank < 1 ||
+      rank > maxRank
+    ) {
+      await sendMessage(
+        message.chat.id,
+        `❌ Можно выбрать ранг от 1 до ${maxRank}.`,
+        env
+      );
+
+      return true;
+    }
+
+    const targetId =
+      await getPanelTempLogin(
+        user.telegram_id,
+        env
+      );
+
+    if (!targetId) {
+      await clearPanelState(
+        user.telegram_id,
+        env
+      );
+
+      await sendMessage(
+        message.chat.id,
+        "❌ Сессия создания устарела. Начните заново.",
+        env
+      );
+
+      return true;
+    }
+
+    await setPanelState(
+      user.telegram_id,
+      "create_admin_login",
+      env
+    );
+
+    /*
+     * Временно сохраняем:
+     * target Telegram ID + rank
+     */
+    await savePanelTempLogin(
+      user.telegram_id,
+      `${targetId}|${rank}`,
+      env
+    );
+
+    await sendMessage(
+      message.chat.id,
+      [
+        "🔑 <b>Логин нового администратора</b>",
+        "",
+        "Введите логин.",
+        "",
+        "Только латинские буквы и цифры.",
+        `Длина: ${LOGIN_MIN_LENGTH}-${LOGIN_MAX_LENGTH}.`,
+      ].join("\n"),
+      env
+    );
+
+    return true;
+  }
+
+  /*
+   * Логин нового администратора.
+   */
+  if (
+    state === "create_admin_login"
+  ) {
+    if (!isValidLogin(text)) {
+      await sendMessage(
+        message.chat.id,
+        "❌ Неверный формат логина.",
+        env
+      );
+
+      return true;
+    }
+
+    const temp =
+      await getPanelTempLogin(
+        user.telegram_id,
+        env
+      );
+
+    if (!temp) {
+      await clearPanelState(
+        user.telegram_id,
+        env
+      );
+
+      return true;
+    }
+
+    const parts =
+      temp.split("|");
+
+    const targetId =
+      parts[0];
+
+    const rank =
+      Number(parts[1]);
+
+    const existingLogin =
+      await env.DB
+        .prepare(
+          `
+          SELECT id
+          FROM users
+          WHERE admin_login = ?
+          LIMIT 1
+          `
+        )
+        .bind(text)
+        .first();
+
+    if (existingLogin) {
+      await sendMessage(
+        message.chat.id,
+        "❌ Такой админ-логин уже занят.",
+        env
+      );
+
+      return true;
+    }
+
+    await env.DB
+      .prepare(
+        `
+        INSERT INTO users (
+          telegram_id,
+          username,
+          first_name,
+          last_name,
+          role,
+          rank,
+          balance,
+          uc,
+          created_at,
+          updated_at,
+          admin_login,
+          admin_password_hash,
+          panel_session,
+          panel_status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      )
+      .bind(
+        targetId,
+        null,
+        null,
+        null,
+        ADMIN_ROLE,
+        rank,
+        0,
+        0,
+        now(),
+        now(),
+        text,
+        null,
+        0,
+        "offline"
+      )
+      .run();
+
+    await clearPanelState(
+      user.telegram_id,
+      env
+    );
+
+    await savePanelTempLogin(
+      user.telegram_id,
+      null,
+      env
+    );
+
+    await sendMessage(
+      message.chat.id,
+      [
+        "✅ <b>Администратор создан.</b>",
+        "",
+        `🆔 Telegram ID: <code>${escapeHtml(
+          targetId
+        )}</code>`,
+        `⭐ Ранг: <b>${rank}</b>`,
+        `🔑 Логин: <code>${escapeHtml(
+          text
+        )}</code>`,
+        "",
+        "⚠️ Пароль новый администратор должен установить отдельно.",
+      ].join("\n"),
+      env
+    );
+
+    return true;
+  }
+
+  return false;
+}
 /* =========================================================
    PANEL STATE
 ========================================================= */
 
-async function getPanelState(
-  telegramId,
-  env
-) {
-  const user = await getUser(
-    telegramId,
-    env
-  );
+async function getPanelState(telegramId, env) {
+  const user = await getUser(telegramId, env);
 
   if (!user) {
     return null;
@@ -1625,21 +1632,15 @@ async function getPanelState(
   return user.panel_temp_state || null;
 }
 
-async function setPanelState(
-  telegramId,
-  state,
-  env
-) {
+async function setPanelState(telegramId, state, env) {
   await env.DB
-    .prepare(
-      `
+    .prepare(`
       UPDATE users
       SET
         panel_temp_state = ?,
         updated_at = ?
       WHERE telegram_id = ?
-      `
-    )
+    `)
     .bind(
       state,
       now(),
@@ -1648,10 +1649,7 @@ async function setPanelState(
     .run();
 }
 
-async function clearPanelState(
-  telegramId,
-  env
-) {
+async function clearPanelState(telegramId, env) {
   await setPanelState(
     telegramId,
     null,
@@ -1665,15 +1663,13 @@ async function savePanelTempLogin(
   env
 ) {
   await env.DB
-    .prepare(
-      `
+    .prepare(`
       UPDATE users
       SET
         admin_login_temp = ?,
         updated_at = ?
       WHERE telegram_id = ?
-      `
-    )
+    `)
     .bind(
       login,
       now(),
@@ -1696,6 +1692,83 @@ async function getPanelTempLogin(
   }
 
   return user.admin_login_temp || null;
+}
+
+/* =========================================================
+   TEMPORARY ADMIN PASSWORD
+   ТОЛЬКО ДЛЯ ПЕРВОНАЧАЛЬНОЙ НАСТРОЙКИ
+========================================================= */
+
+async function setAdminPassword(
+  chatId,
+  user,
+  password,
+  env
+) {
+  /*
+    Временная команда доступна
+    только Главному Администратору 6 ранга.
+  */
+
+  if (
+    user.role !== ADMIN_ROLE ||
+    Number(user.rank) !== 6
+  ) {
+    await sendMessage(
+      chatId,
+      "⛔ Доступ запрещён.",
+      env
+    );
+
+    return;
+  }
+
+  if (!isValidPassword(password)) {
+    await sendMessage(
+      chatId,
+      [
+        "❌ <b>Неверный пароль.</b>",
+        "",
+        `Пароль должен содержать только цифры.`,
+        `Длина: ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH} цифр.`,
+      ].join("\n"),
+      env
+    );
+
+    return;
+  }
+
+  const passwordHash =
+    await hashPassword(password);
+
+  await env.DB
+    .prepare(`
+      UPDATE users
+      SET
+        admin_password_hash = ?,
+        updated_at = ?
+      WHERE telegram_id = ?
+        AND role = 'admin'
+        AND rank = 6
+    `)
+    .bind(
+      passwordHash,
+      now(),
+      user.telegram_id
+    )
+    .run();
+
+  await sendMessage(
+    chatId,
+    [
+      "✅ <b>Пароль установлен.</b>",
+      "",
+      "Теперь используй /alogin.",
+      "",
+      "⚠️ После проверки временную команду установки пароля нужно удалить из кода.",
+    ].join("\n"),
+    env
+  );
 }
 
 /* =========================================================
@@ -1757,14 +1830,10 @@ function isRankBetween(
   );
 }
 
-/*
- * Сейчас создание сотрудников
- * разрешено только 6 рангу.
- */
 function canManageEmployees(user) {
   return (
     isAdmin(user) &&
-    Number(user.rank) === 6
+    Number(user.rank) >= 5
   );
 }
 
@@ -1824,7 +1893,9 @@ async function hashPassword(password) {
     );
 
   return Array
-    .from(new Uint8Array(hash))
+    .from(
+      new Uint8Array(hash)
+    )
     .map(
       byte =>
         byte
@@ -1888,7 +1959,9 @@ function moscowTime() {
       dateStyle: "short",
       timeStyle: "medium",
     }
-  ).format(new Date());
+  ).format(
+    new Date()
+  );
 }
 
 /* =========================================================
@@ -1929,4 +2002,4 @@ function escapeHtml(value) {
       "'",
       "&#039;"
     );
-}
+  }
