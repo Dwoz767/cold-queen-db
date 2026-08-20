@@ -1,280 +1,262 @@
 /**
  * DOXACHKAA UC
- * Cloudflare Worker + D1 + Telegram Bot + Telegram Mini App
+ * Cloudflare Worker + D1 + Telegram Mini App + Telegram Webhook
  *
  * D1 binding:
  *   DB
  *
  * Secrets:
  *   BOT_TOKEN
+ *   SESSION_SECRET
  *   WEBAPP_URL
- *
- * Optional:
- *   WEBHOOK_SECRET
- *
- * IMPORTANT:
- * - Real balances/UC live in D1.
- * - Client localStorage is NOT trusted.
- * - Telegram Mini App initData is verified server-side.
- * - Permissions are checked server-side.
  */
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Telegram-Init-Data",
+  "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
+};
+
+const RANKS = {
+  0: {
+    name: "Игрок",
+    color: "#ffffff",
+  },
+  1: {
+    name: "Администратор",
+    color: "#00aaff",
+  },
+  2: {
+    name: "Администратор",
+    color: "#00ff66",
+  },
+  3: {
+    name: "Следящий администратор",
+    color: "#ff7a00",
+  },
+  4: {
+    name: "Куратор",
+    color: "#b000ff",
+  },
+  5: {
+    name: "Заместитель Главного Администратора",
+    color: "#ff003c",
+  },
+  6: {
+    name: "Главный Администратор",
+    color: "#ff003c",
+  },
+};
+
+const MODERATOR = {
+  name: "Модератор",
+  color: "#ffff00",
+};
+
+const DEFAULT_SETTINGS = {
+  spin_cost: 100,
+  min_withdraw_uc: 3000,
+  daily_bonus: 0,
+  promo_weekly_spin: 1,
+  technical_enabled: 0,
+  technical_message: "",
+  technical_reason: "",
+  technical_ends_at: "",
+  balance_enabled: 1,
+  withdrawal_enabled: 1,
+  promo_enabled: 1,
+  wheel_enabled: 1,
+  global_chat_enabled: 1,
+};
 
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
     try {
-      // --------------------------------------------------
-      // Telegram webhook
-      // --------------------------------------------------
-
-      if (
-        request.method === "POST" &&
-        url.pathname === "/telegram/webhook"
-      ) {
-        return await telegramWebhook(request, env, ctx);
-      }
-
-      // --------------------------------------------------
-      // Mini App / frontend
-      // --------------------------------------------------
-
-      if (request.method === "GET" && url.pathname === "/") {
-        return await serveIndex(env);
-      }
-
-      if (
-        request.method === "GET" &&
-        url.pathname === "/index.html"
-      ) {
-        return await serveIndex(env);
-      }
-
-      // --------------------------------------------------
-      // Health
-      // --------------------------------------------------
-
-      if (
-        request.method === "GET" &&
-        url.pathname === "/api/health"
-      ) {
-        return json({
-          ok: true,
-          service: "doxachkayaa-uc",
-          time: new Date().toISOString()
+      if (request.method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: CORS_HEADERS,
         });
       }
 
-      // --------------------------------------------------
-      // API
-      // --------------------------------------------------
+      const url = new URL(request.url);
 
-      if (url.pathname.startsWith("/api/")) {
-        return await apiRouter(request, env, ctx);
+      /*
+       * Telegram webhook
+       */
+      if (url.pathname === "/telegram/webhook") {
+        return await telegramWebhook(request, env);
       }
 
-      return new Response("Not Found", {
-        status: 404
-      });
+      /*
+       * Health check
+       */
+      if (url.pathname === "/health") {
+        return json({
+          ok: true,
+          service: "doxachkaa_uc",
+          time: new Date().toISOString(),
+        });
+      }
+
+      /*
+       * API
+       */
+      if (url.pathname.startsWith("/api/")) {
+        return await apiRouter(request, env, url);
+      }
+
+      /*
+       * Если Worker используется вместе с Pages/Assets,
+       * сюда можно добавить static assets.
+       */
+      return new Response(
+        "DOXACHKAA UC API ONLINE",
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+          },
+        }
+      );
 
     } catch (error) {
       console.error(error);
 
-      return json({
-        ok: false,
-        error: "INTERNAL_ERROR",
-        message: "Внутренняя ошибка сервера"
-      }, 500);
+      return json(
+        {
+          ok: false,
+          error: "INTERNAL_ERROR",
+          message: "Внутренняя ошибка сервера",
+        },
+        500
+      );
     }
-  }
+  },
 };
 
 
-// ======================================================
-// CONFIG
-// ======================================================
-
-const RANKS = {
-  0: {
-    name: "player",
-    color: "#ffffff"
-  },
-
-  1: {
-    name: "admin",
-    color: "#198cff"
-  },
-
-  2: {
-    name: "admin",
-    color: "#39ff88"
-  },
-
-  3: {
-    name: "admin",
-    color: "#ff8c32"
-  },
-
-  4: {
-    name: "curator",
-    color: "#c45cff"
-  },
-
-  5: {
-    name: "deputy",
-    color: "#ff3030"
-  },
-
-  6: {
-    name: "chief_admin",
-    color: "#ff2020"
-  }
-};
-
-const MODERATOR_ROLE = "moderator";
-
-const ACTION_POINTS = 15;
-const DAILY_ACTIVITY_MINUTES = 240;
-const DAILY_ACTIVITY_BONUS = 100;
-const MIN_WITHDRAW_UC = 3000;
-
-
-// ======================================================
-// RESPONSE HELPERS
-// ======================================================
+/* =========================================================
+   RESPONSE
+========================================================= */
 
 function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store"
+  return new Response(
+    JSON.stringify(data),
+    {
+      status,
+      headers: {
+        ...CORS_HEADERS,
+        "Content-Type": "application/json; charset=utf-8",
+      },
     }
-  });
-}
-
-function html(data, status = 200) {
-  return new Response(data, {
-    status,
-    headers: {
-      "content-type": "text/html; charset=utf-8"
-    }
-  });
-}
-
-function nowISO() {
-  return new Date().toISOString();
-}
-
-function todayMSK() {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Moscow",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  }).format(new Date());
-}
-
-function isAdmin(user) {
-  return Number(user?.rank || 0) >= 1;
-}
-
-function isSenior(user) {
-  return Number(user?.rank || 0) >= 5;
-}
-
-function isChief(user) {
-  return Number(user?.rank || 0) >= 6;
-}
-
-function isCurator(user) {
-  return Number(user?.rank || 0) >= 4;
+  );
 }
 
 
-// ======================================================
-// DATABASE
-// ======================================================
+/* =========================================================
+   DATABASE
+========================================================= */
 
-async function getUser(env, telegramId) {
-  return await env.DB
-    .prepare(`
-      SELECT *
-      FROM users
-      WHERE telegram_id = ?
-      LIMIT 1
-    `)
-    .bind(String(telegramId))
+async function first(db, sql, ...params) {
+  return await db
+    .prepare(sql)
+    .bind(...params)
     .first();
 }
 
-async function ensureUser(env, telegramUser) {
-  const telegramId = String(telegramUser.id);
+async function all(db, sql, ...params) {
+  const result = await db
+    .prepare(sql)
+    .bind(...params)
+    .all();
 
-  let user = await getUser(env, telegramId);
+  return result.results || [];
+}
 
-  if (user) {
-    await env.DB
-      .prepare(`
-        UPDATE users
-        SET
-          username = ?,
-          first_name = ?,
-          last_name = ?,
-          updated_at = ?
-        WHERE telegram_id = ?
-      `)
-      .bind(
-        telegramUser.username || null,
-        telegramUser.first_name || null,
-        telegramUser.last_name || null,
-        nowISO(),
-        telegramId
-      )
-      .run();
-
-    return await getUser(env, telegramId);
-  }
-
-  await env.DB
-    .prepare(`
-      INSERT INTO users (
-        telegram_id,
-        username,
-        first_name,
-        last_name,
-        role,
-        rank,
-        balance,
-        uc,
-        created_at,
-        updated_at,
-        panel_session,
-        panel_status
-      )
-      VALUES (?, ?, ?, ?, 'player', 0, 0, 0, ?, ?, 0, 'offline')
-    `)
-    .bind(
-      telegramId,
-      telegramUser.username || null,
-      telegramUser.first_name || null,
-      telegramUser.last_name || null,
-      nowISO(),
-      nowISO()
-    )
+async function run(db, sql, ...params) {
+  return await db
+    .prepare(sql)
+    .bind(...params)
     .run();
-
-  return await getUser(env, telegramId);
 }
 
 
-// ======================================================
-// TELEGRAM MINI APP AUTH
-// ======================================================
+/* =========================================================
+   SETTINGS
+========================================================= */
+
+async function getSetting(db, key, fallback = null) {
+  const row = await first(
+    db,
+    `
+      SELECT value
+      FROM system_settings
+      WHERE key = ?
+      LIMIT 1
+    `,
+    key
+  );
+
+  if (!row) return fallback;
+
+  return row.value;
+}
+
+async function setSetting(db, key, value, actor) {
+  await run(
+    db,
+    `
+      INSERT INTO system_settings
+      (key, value, updated_by, updated_at)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(key)
+      DO UPDATE SET
+        value = excluded.value,
+        updated_by = excluded.updated_by,
+        updated_at = CURRENT_TIMESTAMP
+    `,
+    key,
+    String(value),
+    actor
+  );
+}
+
+async function getNumberSetting(db, key, fallback) {
+  const value = await getSetting(db, key, null);
+
+  if (value === null) {
+    return fallback;
+  }
+
+  const n = Number(value);
+
+  return Number.isFinite(n) ? n : fallback;
+}
+
+async function getBoolSetting(db, key, fallback = false) {
+  const value = await getSetting(db, key, null);
+
+  if (value === null) {
+    return fallback;
+  }
+
+  return (
+    value === true ||
+    value === 1 ||
+    value === "1" ||
+    value === "true"
+  );
+}
+
+
+/* =========================================================
+   TELEGRAM INIT DATA
+========================================================= */
 
 async function validateTelegramInitData(initData, botToken) {
   if (!initData || !botToken) {
-    return null;
+    throw new Error("Telegram authorization required");
   }
 
   const params = new URLSearchParams(initData);
@@ -282,22 +264,44 @@ async function validateTelegramInitData(initData, botToken) {
   const hash = params.get("hash");
 
   if (!hash) {
-    return null;
+    throw new Error("Missing Telegram hash");
+  }
+
+  const authDate = Number(params.get("auth_date"));
+
+  if (!authDate) {
+    throw new Error("Missing auth_date");
+  }
+
+  /*
+   * Не принимаем старые initData.
+   */
+  const age = Math.floor(Date.now() / 1000) - authDate;
+
+  if (age > 86400 || age < -60) {
+    throw new Error("Telegram session expired");
   }
 
   params.delete("hash");
+  params.delete("signature");
 
   const dataCheckString = [...params.entries()]
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([key, value]) => `${key}=${value}`)
     .join("\n");
 
+  /*
+   * Telegram Web Apps:
+   * secret_key = HMAC_SHA256("WebAppData", bot_token)
+   * hash = HMAC_SHA256(secret_key, data_check_string)
+   */
+
   const secretKey = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode("WebAppData"),
     {
       name: "HMAC",
-      hash: "SHA-256"
+      hash: "SHA-256",
     },
     false,
     ["sign"]
@@ -309,333 +313,500 @@ async function validateTelegramInitData(initData, botToken) {
     new TextEncoder().encode(botToken)
   );
 
-  const secretHex = [...new Uint8Array(secret)]
-    .map(x => x.toString(16).padStart(2, "0"))
-    .join("");
-
   const dataKey = await crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(secretHex),
+    secret,
     {
       name: "HMAC",
-      hash: "SHA-256"
+      hash: "SHA-256",
     },
     false,
     ["sign"]
   );
 
-  const signature = await crypto.subtle.sign(
+  const calculated = await crypto.subtle.sign(
     "HMAC",
     dataKey,
     new TextEncoder().encode(dataCheckString)
   );
 
-  const calculated = [...new Uint8Array(signature)]
+  const calculatedHex = [...new Uint8Array(calculated)]
     .map(x => x.toString(16).padStart(2, "0"))
     .join("");
 
-  if (calculated !== hash) {
-    return null;
+  if (!timingSafeEqual(calculatedHex, hash)) {
+    throw new Error("Invalid Telegram signature");
   }
 
-  const authDate = Number(params.get("auth_date") || 0);
+  const userRaw = params.get("user");
 
-  if (!authDate) {
-    return null;
+  if (!userRaw) {
+    throw new Error("Telegram user missing");
   }
 
-  // 24 часа
-  if (
-    Math.floor(Date.now() / 1000) - authDate >
-    86400
-  ) {
-    return null;
+  return JSON.parse(userRaw);
+}
+
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false;
+
+  let result = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
 
-  let user;
+  return result === 0;
+}
 
-  try {
-    user = JSON.parse(params.get("user") || "{}");
-  } catch {
-    return null;
-  }
 
-  if (!user.id) {
-    return null;
+/* =========================================================
+   AUTH
+========================================================= */
+
+async function getTelegramUser(request, env) {
+  const initData =
+    request.headers.get("X-Telegram-Init-Data") ||
+    request.headers.get("Authorization")?.replace(
+      /^Bearer\s+/i,
+      ""
+    );
+
+  return await validateTelegramInitData(
+    initData,
+    env.BOT_TOKEN
+  );
+}
+
+async function ensureUser(db, tgUser) {
+  const telegramId = String(tgUser.id);
+
+  let user = await first(
+    db,
+    `
+      SELECT *
+      FROM users
+      WHERE telegram_id = ?
+      LIMIT 1
+    `,
+    telegramId
+  );
+
+  if (!user) {
+    const now = new Date().toISOString();
+
+    await run(
+      db,
+      `
+        INSERT INTO users
+        (
+          telegram_id,
+          username,
+          first_name,
+          last_name,
+          role,
+          rank,
+          balance,
+          uc,
+          created_at,
+          updated_at,
+          panel_session,
+          panel_status
+        )
+        VALUES (?, ?, ?, ?, 'player', 0, 0, 0, ?, ?, 0, 'offline')
+      `,
+      telegramId,
+      tgUser.username || null,
+      tgUser.first_name || null,
+      tgUser.last_name || null,
+      now,
+      now
+    );
+
+    user = await first(
+      db,
+      `
+        SELECT *
+        FROM users
+        WHERE telegram_id = ?
+      `,
+      telegramId
+    );
+  } else {
+    await run(
+      db,
+      `
+        UPDATE users
+        SET
+          username = ?,
+          first_name = ?,
+          last_name = ?,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE telegram_id = ?
+      `,
+      tgUser.username || null,
+      tgUser.first_name || null,
+      tgUser.last_name || null,
+      telegramId
+    );
   }
 
   return user;
 }
 
 
-// ======================================================
-// API AUTH
-// ======================================================
+/* =========================================================
+   ROLE
+========================================================= */
 
-async function authenticateRequest(request, env) {
-  const initData =
-    request.headers.get("X-Telegram-Init-Data") ||
-    request.headers.get("Authorization")?.replace(
-      /^tma\s+/i,
-      ""
-    );
+function numericRank(user) {
+  const rank = Number(user?.rank || 0);
 
-  if (!initData) {
-    return null;
+  return Number.isFinite(rank) ? rank : 0;
+}
+
+function isAdmin(user) {
+  return numericRank(user) >= 1;
+}
+
+function isSenior(user) {
+  return numericRank(user) >= 5;
+}
+
+function isSuperAdmin(user) {
+  return numericRank(user) >= 6;
+}
+
+function canRank(user, targetRank) {
+  const rank = numericRank(user);
+  const target = Number(targetRank);
+
+  if (rank === 6) {
+    return target >= 0 && target <= 6;
   }
 
-  const telegramUser =
-    await validateTelegramInitData(
-      initData,
-      env.BOT_TOKEN
-    );
-
-  if (!telegramUser) {
-    return null;
+  if (rank === 5) {
+    return target >= 0 && target <= 5;
   }
 
-  return await ensureUser(
-    env,
-    telegramUser
+  return false;
+}
+
+function canManageTarget(actor, target) {
+  const actorRank = numericRank(actor);
+  const targetRank = numericRank(target);
+
+  if (actorRank === 6) {
+    return true;
+  }
+
+  if (actorRank === 5) {
+    return targetRank <= 5;
+  }
+
+  return false;
+}
+
+
+/* =========================================================
+   PANEL SESSION
+========================================================= */
+
+async function requirePanel(request, env, minimumRank = 1) {
+  const tgUser = await getTelegramUser(request, env);
+
+  const db = env.DB;
+
+  const user = await ensureUser(
+    db,
+    tgUser
+  );
+
+  if (numericRank(user) < minimumRank) {
+    throw new Error("FORBIDDEN");
+  }
+
+  if (!Number(user.panel_session)) {
+    throw new Error("PANEL_LOGIN_REQUIRED");
+  }
+
+  /*
+   * Продлеваем активность.
+   */
+  await run(
+    db,
+    `
+      UPDATE users
+      SET panel_last_activity = CURRENT_TIMESTAMP,
+          panel_status = 'online'
+      WHERE telegram_id = ?
+    `,
+    user.telegram_id
+  );
+
+  return await first(
+    db,
+    `
+      SELECT *
+      FROM users
+      WHERE telegram_id = ?
+    `,
+    user.telegram_id
   );
 }
 
 
-// ======================================================
-// API ROUTER
-// ======================================================
+/* =========================================================
+   API ROUTER
+========================================================= */
 
-async function apiRouter(request, env, ctx) {
-  const url = new URL(request.url);
+async function apiRouter(request, env, url) {
+  const path = url.pathname;
 
-  const user =
-    await authenticateRequest(
-      request,
-      env
-    );
-
-  // Public endpoint
-  if (url.pathname === "/api/config") {
-    return await getPublicConfig(env);
+  if (path === "/api/config" && request.method === "GET") {
+    return await apiConfig(env);
   }
 
-  if (!user) {
-    return json({
+  if (path === "/api/me" && request.method === "GET") {
+    return await apiMe(request, env);
+  }
+
+  if (path === "/api/spin" && request.method === "POST") {
+    return await apiSpin(request, env);
+  }
+
+  if (path === "/api/topup" && request.method === "POST") {
+    return await apiTopup(request, env);
+  }
+
+  if (path === "/api/withdraw" && request.method === "POST") {
+    return await apiWithdraw(request, env);
+  }
+
+  if (path === "/api/daily-bonus" && request.method === "POST") {
+    return await apiDailyBonus(request, env);
+  }
+
+  if (path === "/api/promo/use" && request.method === "POST") {
+    return await apiPromoUse(request, env);
+  }
+
+  if (path === "/api/admin/login" && request.method === "POST") {
+    return await apiAdminLogin(request, env);
+  }
+
+  if (path === "/api/admin/logout" && request.method === "POST") {
+    return await apiAdminLogout(request, env);
+  }
+
+  if (path === "/api/admin/dashboard" && request.method === "GET") {
+    return await apiAdminDashboard(request, env);
+  }
+
+  if (path === "/api/admin/users" && request.method === "GET") {
+    return await apiAdminUsers(request, env);
+  }
+
+  if (path === "/api/admin/user" && request.method === "GET") {
+    return await apiAdminUser(request, env);
+  }
+
+  if (path === "/api/admin/rank" && request.method === "POST") {
+    return await apiAdminRank(request, env);
+  }
+
+  if (path === "/api/admin/balance" && request.method === "POST") {
+    return await apiAdminBalance(request, env);
+  }
+
+  if (path === "/api/admin/uc" && request.method === "POST") {
+    return await apiAdminUC(request, env);
+  }
+
+  if (path === "/api/admin/settings" && request.method === "GET") {
+    return await apiAdminSettings(request, env);
+  }
+
+  if (path === "/api/admin/settings" && request.method === "POST") {
+    return await apiAdminSettingsSave(request, env);
+  }
+
+  if (path === "/api/admin/wheel" && request.method === "GET") {
+    return await apiAdminWheel(request, env);
+  }
+
+  if (path === "/api/admin/wheel" && request.method === "POST") {
+    return await apiAdminWheelSave(request, env);
+  }
+
+  if (path === "/api/admin/activity" && request.method === "GET") {
+    return await apiAdminActivity(request, env);
+  }
+
+  if (path === "/api/admin/complaints" && request.method === "GET") {
+    return await apiAdminComplaints(request, env);
+  }
+
+  if (path === "/api/admin/logs" && request.method === "GET") {
+    return await apiAdminLogs(request, env);
+  }
+
+  if (path === "/api/admin/maintenance" && request.method === "POST") {
+    return await apiAdminMaintenance(request, env);
+  }
+
+  if (path === "/api/admin/employees" && request.method === "GET") {
+    return await apiAdminEmployees(request, env);
+  }
+
+  if (path === "/api/admin/employee/access" && request.method === "POST") {
+    return await apiAdminEmployeeAccess(request, env);
+  }
+
+  return json(
+    {
       ok: false,
-      error: "UNAUTHORIZED"
-    }, 401);
-  }
-
-  // ----------------------------------------------------
-  // ME
-  // ----------------------------------------------------
-
-  if (
-    request.method === "GET" &&
-    url.pathname === "/api/me"
-  ) {
-    return await apiMe(user, env);
-  }
-
-  // ----------------------------------------------------
-  // WHEEL
-  // ----------------------------------------------------
-
-  if (
-    request.method === "GET" &&
-    url.pathname === "/api/wheel"
-  ) {
-    return await apiWheel(env);
-  }
-
-  if (
-    request.method === "POST" &&
-    url.pathname === "/api/wheel/spin"
-  ) {
-    return await apiSpin(
-      request,
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // PROFILE
-  // ----------------------------------------------------
-
-  if (
-    request.method === "GET" &&
-    url.pathname === "/api/profile"
-  ) {
-    return await apiProfile(user, env);
-  }
-
-  // ----------------------------------------------------
-  // DAILY BONUS
-  // ----------------------------------------------------
-
-  if (
-    request.method === "POST" &&
-    url.pathname === "/api/daily-bonus"
-  ) {
-    return await claimDailyBonus(
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // TOPUP
-  // ----------------------------------------------------
-
-  if (
-    request.method === "POST" &&
-    url.pathname === "/api/topup"
-  ) {
-    return await createTopup(
-      request,
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // WITHDRAW
-  // ----------------------------------------------------
-
-  if (
-    request.method === "POST" &&
-    url.pathname === "/api/withdraw"
-  ) {
-    return await createWithdrawal(
-      request,
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // COMPLAINTS
-  // ----------------------------------------------------
-
-  if (
-    request.method === "POST" &&
-    url.pathname === "/api/complaints"
-  ) {
-    return await createComplaint(
-      request,
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // CHAT
-  // ----------------------------------------------------
-
-  if (
-    request.method === "GET" &&
-    url.pathname === "/api/chat"
-  ) {
-    return await getChat(
-      user,
-      env
-    );
-  }
-
-  if (
-    request.method === "POST" &&
-    url.pathname === "/api/chat"
-  ) {
-    return await sendChatMessage(
-      request,
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // ADMIN
-  // ----------------------------------------------------
-
-  if (url.pathname.startsWith("/api/admin/")) {
-
-    if (!isAdmin(user)) {
-      return json({
-        ok: false,
-        error: "FORBIDDEN"
-      }, 403);
-    }
-
-    return await adminRouter(
-      request,
-      user,
-      env
-    );
-  }
-
-  return json({
-    ok: false,
-    error: "NOT_FOUND"
-  }, 404);
+      error: "NOT_FOUND",
+    },
+    404
+  );
 }
 
 
-// ======================================================
-// PUBLIC CONFIG
-// ======================================================
+/* =========================================================
+   PUBLIC CONFIG
+========================================================= */
 
-async function getPublicConfig(env) {
-  const wheel =
-    await env.DB
-      .prepare(`
-        SELECT *
-        FROM wheel_settings
-        WHERE id = 1
-      `)
-      .first();
+async function apiConfig(env) {
+  const db = env.DB;
 
-  const maintenance =
-    await env.DB
-      .prepare(`
-        SELECT *
-        FROM maintenance_settings
-        WHERE id = 1
-      `)
-      .first();
+  const spinCost = await getNumberSetting(
+    db,
+    "spin_cost",
+    DEFAULT_SETTINGS.spin_cost
+  );
+
+  const minWithdraw = await getNumberSetting(
+    db,
+    "min_withdraw_uc",
+    DEFAULT_SETTINGS.min_withdraw_uc
+  );
+
+  const maintenance = await first(
+    db,
+    `
+      SELECT *
+      FROM maintenance_settings
+      WHERE id = 1
+    `
+  );
+
+  const wheel = await first(
+    db,
+    `
+      SELECT *
+      FROM wheel_settings
+      WHERE id = 1
+    `
+  );
+
+  const prizes = await all(
+    db,
+    `
+      SELECT
+        id,
+        name,
+        prize_type,
+        prize_value,
+        probability,
+        enabled,
+        sort_order
+      FROM wheel_prizes
+      WHERE enabled = 1
+      ORDER BY sort_order ASC, id ASC
+    `
+  );
 
   return json({
     ok: true,
 
-    wheel: wheel || {
-      spin_cost: 0,
-      currency: "RUB",
-      enabled: 1
+    settings: {
+      spin_cost: spinCost,
+      min_withdraw_uc: minWithdraw,
+      daily_bonus: await getNumberSetting(
+        db,
+        "daily_bonus",
+        0
+      ),
+      promo_weekly_spin: await getBoolSetting(
+        db,
+        "promo_weekly_spin",
+        true
+      ),
+      balance_enabled:
+        await getBoolSetting(
+          db,
+          "balance_enabled",
+          true
+        ),
+      withdrawal_enabled:
+        await getBoolSetting(
+          db,
+          "withdrawal_enabled",
+          true
+        ),
+      promo_enabled:
+        await getBoolSetting(
+          db,
+          "promo_enabled",
+          true
+        ),
     },
+
+    wheel: wheel || {
+      spin_cost: spinCost,
+      currency: "RUB",
+      enabled: 1,
+    },
+
+    prizes,
 
     maintenance: maintenance || {
-      enabled: 0
+      enabled: 0,
+      message: "",
+      reason: "",
+      ends_at: null,
     },
-
-    minWithdrawUC: MIN_WITHDRAW_UC
   });
 }
 
 
-// ======================================================
-// ME
-// ======================================================
+/* =========================================================
+   ME
+========================================================= */
 
-async function apiMe(user, env) {
-  const restrictions =
-    await env.DB
-      .prepare(`
-        SELECT *
-        FROM user_restrictions
-        WHERE telegram_id = ?
-      `)
-      .bind(user.telegram_id)
-      .first();
+async function apiMe(request, env) {
+  const tgUser = await getTelegramUser(
+    request,
+    env
+  );
+
+  const db = env.DB;
+
+  const user = await ensureUser(
+    db,
+    tgUser
+  );
+
+  const rank = numericRank(user);
+
+  /*
+   * 5-6 скрыты, пока не авторизованы
+   * в панели.
+   */
+  const hidden =
+    rank >= 5 &&
+    !Number(user.panel_session);
 
   return json({
     ok: true,
@@ -647,342 +818,200 @@ async function apiMe(user, env) {
       last_name: user.last_name,
 
       role: user.role,
-      rank: user.rank,
+      rank,
 
-      balance: Number(user.balance),
-      uc: Number(user.uc),
+      rank_name:
+        rank >= 1
+          ? RANKS[rank]?.name
+          : "Игрок",
+
+      rank_color:
+        rank >= 1
+          ? RANKS[rank]?.color
+          : "#ffffff",
+
+      balance: Number(user.balance || 0),
+      uc: Number(user.uc || 0),
 
       panel_session:
-        Number(user.panel_session) === 1,
+        Boolean(Number(user.panel_session)),
+
+      hidden,
 
       panel_status:
-        user.panel_status,
-
-      restrictions: restrictions || {
-        balance_blocked: 0,
-        uc_blocked: 0
-      }
-    }
+        user.panel_status || "offline",
+    },
   });
 }
 
 
-// ======================================================
-// PROFILE
-// ======================================================
+/* =========================================================
+   SPIN
+========================================================= */
 
-async function apiProfile(user, env) {
-  const spins =
-    await env.DB
-      .prepare(`
-        SELECT COUNT(*) AS total
-        FROM spin_history
-        WHERE telegram_id = ?
-      `)
-      .bind(user.telegram_id)
-      .first();
+async function apiSpin(request, env) {
+  const tgUser = await getTelegramUser(
+    request,
+    env
+  );
 
-  const complaints =
-    await env.DB
-      .prepare(`
-        SELECT COUNT(*) AS total
-        FROM complaints
-        WHERE reporter_telegram_id = ?
-      `)
-      .bind(user.telegram_id)
-      .first();
+  const db = env.DB;
 
-  return json({
-    ok: true,
+  const user = await ensureUser(
+    db,
+    tgUser
+  );
 
-    profile: {
-      id: user.telegram_id,
-      username: user.username,
-      name: [
-        user.first_name,
-        user.last_name
-      ].filter(Boolean).join(" "),
+  const restriction = await first(
+    db,
+    `
+      SELECT *
+      FROM user_restrictions
+      WHERE telegram_id = ?
+    `,
+    user.telegram_id
+  );
 
-      role: user.role,
-      rank: user.rank,
-
-      balance: Number(user.balance),
-      uc: Number(user.uc),
-
-      spins: Number(spins?.total || 0),
-      complaints: Number(complaints?.total || 0),
-
-      created_at: user.created_at
-    }
-  });
-}
-
-
-// ======================================================
-// WHEEL
-// ======================================================
-
-async function apiWheel(env) {
-  const settings =
-    await env.DB
-      .prepare(`
-        SELECT *
-        FROM wheel_settings
-        WHERE id = 1
-      `)
-      .first();
-
-  const prizes =
-    await env.DB
-      .prepare(`
-        SELECT
-          id,
-          name,
-          prize_type,
-          prize_value,
-          probability,
-          enabled,
-          sort_order
-        FROM wheel_prizes
-        WHERE enabled = 1
-        ORDER BY sort_order ASC, id ASC
-      `)
-      .all();
-
-  return json({
-    ok: true,
-    settings,
-    prizes: prizes.results || []
-  });
-}
-
-
-// ======================================================
-// SECURE RANDOM
-// ======================================================
-
-function secureRandom() {
-  const array =
-    new Uint32Array(1);
-
-  crypto.getRandomValues(array);
-
-  return array[0] /
-    4294967296;
-}
-
-
-// ======================================================
-// PICK PRIZE
-// ======================================================
-
-function choosePrize(prizes) {
-  if (!prizes.length) {
-    return null;
+  if (
+    restriction &&
+    Number(restriction.balance_blocked)
+  ) {
+    return json({
+      ok: false,
+      error: "BALANCE_BLOCKED",
+    }, 403);
   }
 
-  const total =
-    prizes.reduce(
-      (sum, prize) =>
-        sum + Number(prize.probability || 0),
-      0
-    );
-
-  if (total <= 0) {
-    return prizes[0];
+  if (
+    restriction &&
+    Number(restriction.uc_blocked)
+  ) {
+    return json({
+      ok: false,
+      error: "UC_BLOCKED",
+    }, 403);
   }
 
-  let random =
-    secureRandom() * total;
-
-  for (const prize of prizes) {
-
-    random -=
-      Number(prize.probability || 0);
-
-    if (random <= 0) {
-      return prize;
-    }
-  }
-
-  return prizes[prizes.length - 1];
-}
-
-
-// ======================================================
-// SPIN
-// ======================================================
-
-async function apiSpin(request, user, env) {
-
-  const maintenance =
-    await env.DB
-      .prepare(`
-        SELECT *
-        FROM maintenance_settings
-        WHERE id = 1
-      `)
-      .first();
+  const maintenance = await first(
+    db,
+    `
+      SELECT *
+      FROM maintenance_settings
+      WHERE id = 1
+    `
+  );
 
   if (
     maintenance &&
-    Number(maintenance.enabled) === 1
+    Number(maintenance.enabled)
   ) {
     return json({
       ok: false,
       error: "MAINTENANCE",
       message:
         maintenance.message ||
-        "Игра временно недоступна"
+        "Технические работы",
     }, 503);
   }
 
-  const settings =
-    await env.DB
-      .prepare(`
-        SELECT *
-        FROM wheel_settings
-        WHERE id = 1
-      `)
-      .first();
-
-  if (!settings) {
-    return json({
-      ok: false,
-      error: "WHEEL_NOT_CONFIGURED"
-    }, 500);
-  }
+  const wheel = await first(
+    db,
+    `
+      SELECT *
+      FROM wheel_settings
+      WHERE id = 1
+    `
+  );
 
   if (
-    Number(settings.enabled) !== 1
+    wheel &&
+    !Number(wheel.enabled)
   ) {
     return json({
       ok: false,
-      error: "WHEEL_DISABLED"
-    }, 403);
-  }
-
-  const restriction =
-    await env.DB
-      .prepare(`
-        SELECT *
-        FROM user_restrictions
-        WHERE telegram_id = ?
-      `)
-      .bind(user.telegram_id)
-      .first();
-
-  if (
-    restriction &&
-    Number(restriction.uc_blocked) === 1
-  ) {
-    return json({
-      ok: false,
-      error: "UC_BLOCKED"
-    }, 403);
-  }
-
-  if (
-    restriction &&
-    Number(restriction.balance_blocked) === 1
-  ) {
-    return json({
-      ok: false,
-      error: "BALANCE_BLOCKED"
+      error: "WHEEL_DISABLED",
     }, 403);
   }
 
   const cost =
-    Number(settings.spin_cost || 0);
+    Number(
+      wheel?.spin_cost ??
+      await getNumberSetting(
+        db,
+        "spin_cost",
+        100
+      )
+    );
 
-  if (Number(user.balance) < cost) {
+  const balance =
+    Number(user.balance || 0);
+
+  if (balance < cost) {
     return json({
       ok: false,
       error: "INSUFFICIENT_BALANCE",
       required: cost,
-      balance: Number(user.balance)
+      balance,
     }, 400);
   }
 
-  const prizes =
-    await env.DB
-      .prepare(`
-        SELECT *
-        FROM wheel_prizes
-        WHERE enabled = 1
-        ORDER BY sort_order ASC, id ASC
-      `)
-      .all();
+  const prizes = await all(
+    db,
+    `
+      SELECT *
+      FROM wheel_prizes
+      WHERE enabled = 1
+      ORDER BY sort_order ASC, id ASC
+    `
+  );
 
-  const prize =
-    choosePrize(prizes.results || []);
-
-  if (!prize) {
+  if (!prizes.length) {
     return json({
       ok: false,
-      error: "NO_PRIZES"
+      error: "NO_PRIZES",
     }, 500);
   }
 
+  const prize =
+    weightedPrize(prizes);
+
+  const oldBalance =
+    Number(user.balance || 0);
+
+  const oldUC =
+    Number(user.uc || 0);
+
   const newBalance =
-    Number(user.balance) - cost;
+    oldBalance - cost;
 
   const prizeUC =
     prize.prize_type === "uc"
       ? Number(prize.prize_value || 0)
       : 0;
 
-  const prizeBalance =
-    prize.prize_type === "balance"
-      ? Number(prize.prize_value || 0)
-      : 0;
-
   const newUC =
-    Number(user.uc) + prizeUC;
+    oldUC + prizeUC;
 
-  const spinNumber =
-    await getNextSpinNumber(
-      user.telegram_id,
-      env
-    );
-
-  // ----------------------------------------------------
-  // TRANSACTION
-  // ----------------------------------------------------
-
-  await env.DB.batch([
-
-    env.DB.prepare(`
+  /*
+   * Транзакционный batch.
+   */
+  await db.batch([
+    db.prepare(`
       UPDATE users
       SET
         balance = ?,
         uc = ?,
-        updated_at = ?
+        updated_at = CURRENT_TIMESTAMP
       WHERE telegram_id = ?
     `).bind(
       newBalance,
       newUC,
-      nowISO(),
       user.telegram_id
     ),
 
-    env.DB.prepare(`
-      INSERT INTO spins (
-        telegram_id,
-        spin_number,
-        prize_uc,
-        prize_balance
-      )
-      VALUES (?, ?, ?, ?)
-    `).bind(
-      user.telegram_id,
-      spinNumber,
-      prizeUC,
-      prizeBalance
-    ),
-
-    env.DB.prepare(`
-      INSERT INTO spin_history (
+    db.prepare(`
+      INSERT INTO spin_history
+      (
         telegram_id,
         prize_id,
         prize_name,
@@ -996,46 +1025,52 @@ async function apiSpin(request, user, env) {
       prize.id,
       prize.name,
       prize.prize_type,
-      Number(prize.prize_value || 0),
+      prizeUC,
       cost
     ),
 
-    env.DB.prepare(`
-      INSERT INTO spin_audit (
-        actor_telegram_id,
-        target_telegram_id,
-        old_spins,
-        new_spins,
-        amount,
-        reason
+    db.prepare(`
+      INSERT INTO spins
+      (
+        telegram_id,
+        spin_number,
+        prize_uc,
+        prize_balance
       )
-      VALUES (?, ?, ?, ?, ?, ?)
+      SELECT
+        ?,
+        COALESCE(
+          MAX(spin_number),
+          0
+        ) + 1,
+        ?,
+        0
+      FROM spins
+      WHERE telegram_id = ?
     `).bind(
       user.telegram_id,
-      user.telegram_id,
-      spinNumber - 1,
-      spinNumber,
-      cost,
-      "wheel_spin"
+      prizeUC,
+      user.telegram_id
     ),
 
-    env.DB.prepare(`
-      INSERT INTO transactions (
+    db.prepare(`
+      INSERT INTO transactions
+      (
         telegram_id,
         type,
         amount,
         description
       )
-      VALUES (?, ?, ?, ?)
+      VALUES (?, 'spin', ?, ?)
     `).bind(
       user.telegram_id,
-      "wheel_spin",
       -cost,
-      `Прокрутка #${spinNumber}`
+      `Прокрутка: ${prize.name}`
     ),
 
-    env.DB.prepare(`
-      INSERT INTO uc_audit (
+    db.prepare(`
+      INSERT INTO uc_audit
+      (
         actor_telegram_id,
         target_telegram_id,
         old_uc,
@@ -1047,163 +1082,76 @@ async function apiSpin(request, user, env) {
     `).bind(
       user.telegram_id,
       user.telegram_id,
-      Number(user.uc),
+      oldUC,
       newUC,
       prizeUC,
-      `wheel:${prize.name}`
+      "Колесо"
     )
-
   ]);
 
   return json({
     ok: true,
 
-    spin: {
-      number: spinNumber,
+    prize: {
+      id: prize.id,
+      name: prize.name,
+      type: prize.prize_type,
+      value: prizeUC,
+    },
 
-      prize: {
-        id: prize.id,
-        name: prize.name,
-        type: prize.prize_type,
-        value: Number(prize.prize_value || 0)
-      },
-
-      balance: newBalance,
-      uc: newUC,
-      cost
-    }
+    balance: newBalance,
+    uc: newUC,
+    cost,
   });
 }
 
+function weightedPrize(prizes) {
+  let total = 0;
 
-async function getNextSpinNumber(
-  telegramId,
-  env
-) {
-  const row =
-    await env.DB
-      .prepare(`
-        SELECT MAX(spin_number) AS max_spin
-        FROM spins
-        WHERE telegram_id = ?
-      `)
-      .bind(telegramId)
-      .first();
-
-  return Number(row?.max_spin || 0) + 1;
-}
-
-
-// ======================================================
-// DAILY BONUS
-// ======================================================
-
-async function claimDailyBonus(user, env) {
-
-  const today =
-    todayMSK();
-
-  const record =
-    await env.DB
-      .prepare(`
-        SELECT *
-        FROM daily_bonuses
-        WHERE telegram_id = ?
-      `)
-      .bind(user.telegram_id)
-      .first();
-
-  if (
-    record &&
-    record.last_claim_date === today
-  ) {
-    return json({
-      ok: false,
-      error: "ALREADY_CLAIMED"
-    }, 400);
+  for (const prize of prizes) {
+    total += Math.max(
+      0,
+      Number(prize.probability || 0)
+    );
   }
 
-  const reward =
-    await getSystemNumber(
-      env,
-      "daily_bonus_uc",
-      100
+  if (total <= 0) {
+    return prizes[
+      Math.floor(
+        Math.random() * prizes.length
+      )
+    ];
+  }
+
+  let random =
+    Math.random() * total;
+
+  for (const prize of prizes) {
+    random -= Math.max(
+      0,
+      Number(prize.probability || 0)
     );
 
-  const newUC =
-    Number(user.uc) + reward;
+    if (random <= 0) {
+      return prize;
+    }
+  }
 
-  await env.DB.batch([
-
-    env.DB.prepare(`
-      INSERT INTO daily_bonuses (
-        telegram_id,
-        last_claim_date,
-        updated_at
-      )
-      VALUES (?, ?, ?)
-      ON CONFLICT(telegram_id)
-      DO UPDATE SET
-        last_claim_date = excluded.last_claim_date,
-        updated_at = excluded.updated_at
-    `).bind(
-      user.telegram_id,
-      today,
-      nowISO()
-    ),
-
-    env.DB.prepare(`
-      UPDATE users
-      SET
-        uc = ?,
-        updated_at = ?
-      WHERE telegram_id = ?
-    `).bind(
-      newUC,
-      nowISO(),
-      user.telegram_id
-    ),
-
-    env.DB.prepare(`
-      INSERT INTO uc_audit (
-        actor_telegram_id,
-        target_telegram_id,
-        old_uc,
-        new_uc,
-        amount,
-        reason
-      )
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      user.telegram_id,
-      user.telegram_id,
-      Number(user.uc),
-      newUC,
-      reward,
-      "daily_bonus"
-    )
-
-  ]);
-
-  return json({
-    ok: true,
-    reward,
-    uc: newUC
-  });
+  return prizes[prizes.length - 1];
 }
-// ======================================================
-// TOPUP
-// ======================================================
 
-async function createTopup(
-  request,
-  user,
-  env
-) {
-  const body =
-    await request.json().catch(
-      () => ({})
-    );
+
+/* =========================================================
+   TOPUP
+========================================================= */
+
+async function apiTopup(request, env) {
+  const tgUser = await getTelegramUser(
+    request,
+    env
+  );
+
+  const body = await request.json();
 
   const amount =
     Number(body.amount);
@@ -1214,53 +1162,73 @@ async function createTopup(
   ) {
     return json({
       ok: false,
-      error: "INVALID_AMOUNT"
+      error: "INVALID_AMOUNT",
     }, 400);
   }
 
-  const result =
-    await env.DB
-      .prepare(`
-        INSERT INTO topup_requests (
-          telegram_id,
-          amount,
-          status
-        )
-        VALUES (?, ?, 'pending')
-      `)
-      .bind(
-        user.telegram_id,
-        amount
+  const db = env.DB;
+
+  const user =
+    await ensureUser(db, tgUser);
+
+  const id = await run(
+    db,
+    `
+      INSERT INTO topup_requests
+      (
+        telegram_id,
+        amount,
+        status
       )
-      .run();
+      VALUES (?, ?, 'pending')
+    `,
+    user.telegram_id,
+    amount
+  );
+
+  await run(
+    db,
+    `
+      INSERT INTO notification_center
+      (
+        target_telegram_id,
+        type,
+        title,
+        message
+      )
+      VALUES
+      (
+        NULL,
+        'topup',
+        'Новое пополнение',
+        ?
+      )
+    `,
+    `Заявка #${id.meta?.last_row_id || "new"} от ${user.telegram_id}: ${amount} RUB`
+  );
 
   return json({
     ok: true,
-    request_id:
-      result.meta.last_row_id,
-    amount,
-    status: "pending"
+    message:
+      "Заявка на пополнение создана",
   });
 }
 
 
-// ======================================================
-// WITHDRAW
-// ======================================================
+/* =========================================================
+   WITHDRAW
+========================================================= */
 
-async function createWithdrawal(
-  request,
-  user,
-  env
-) {
-  const body =
-    await request.json().catch(
-      () => ({})
-    );
+async function apiWithdraw(request, env) {
+  const tgUser = await getTelegramUser(
+    request,
+    env
+  );
+
+  const body = await request.json();
 
   const pubgId =
-    String(body.pubg_mobile_id || "")
-      .trim();
+    String(body.pubg_mobile_id || "").trim();
 
   const amount =
     Number(body.uc_amount);
@@ -1268,683 +1236,874 @@ async function createWithdrawal(
   if (!pubgId) {
     return json({
       ok: false,
-      error: "PUBG_ID_REQUIRED"
+      error: "PUBG_ID_REQUIRED",
     }, 400);
   }
 
   if (
     !Number.isInteger(amount) ||
-    amount < MIN_WITHDRAW_UC
+    amount <= 0
   ) {
     return json({
       ok: false,
-      error: "MINIMUM_WITHDRAW",
-      minimum: MIN_WITHDRAW_UC
+      error: "INVALID_UC",
+    }, 400);
+  }
+
+  const db = env.DB;
+
+  const user =
+    await ensureUser(db, tgUser);
+
+  const min =
+    await getNumberSetting(
+      db,
+      "min_withdraw_uc",
+      3000
+    );
+
+  if (amount < min) {
+    return json({
+      ok: false,
+      error: "MIN_WITHDRAW",
+      min,
     }, 400);
   }
 
   if (Number(user.uc) < amount) {
     return json({
       ok: false,
-      error: "INSUFFICIENT_UC"
+      error: "INSUFFICIENT_UC",
     }, 400);
   }
 
-  const restriction =
-    await env.DB
-      .prepare(`
-        SELECT *
-        FROM user_restrictions
-        WHERE telegram_id = ?
-      `)
-      .bind(user.telegram_id)
-      .first();
-
-  if (
-    restriction &&
-    Number(restriction.uc_blocked) === 1
-  ) {
-    return json({
-      ok: false,
-      error: "UC_BLOCKED"
-    }, 403);
-  }
-
-  const result =
-    await env.DB
-      .prepare(`
-        INSERT INTO payout_requests (
-          telegram_id,
-          pubg_mobile_id,
-          uc_amount,
-          status
-        )
-        VALUES (?, ?, ?, 'pending')
-      `)
-      .bind(
-        user.telegram_id,
-        pubgId,
-        amount
+  const result = await run(
+    db,
+    `
+      INSERT INTO payout_requests
+      (
+        telegram_id,
+        pubg_mobile_id,
+        uc_amount
       )
-      .run();
+      VALUES (?, ?, ?)
+    `,
+    user.telegram_id,
+    pubgId,
+    amount
+  );
+
+  await run(
+    db,
+    `
+      INSERT INTO notification_center
+      (
+        target_telegram_id,
+        type,
+        title,
+        message
+      )
+      VALUES
+      (
+        NULL,
+        'withdraw',
+        'Новая заявка на вывод',
+        ?
+      )
+    `,
+    `Вывод ${amount} UC от ${user.telegram_id}`
+  );
 
   return json({
     ok: true,
     request_id:
-      result.meta.last_row_id,
-    status: "pending"
+      result.meta?.last_row_id || null,
   });
 }
+/* =========================================================
+   DAILY BONUS
+========================================================= */
 
+async function apiDailyBonus(request, env) {
+  const tgUser = await getTelegramUser(
+    request,
+    env
+  );
 
-// ======================================================
-// COMPLAINTS
-// ======================================================
+  const db = env.DB;
 
-async function createComplaint(
-  request,
-  user,
-  env
-) {
-  const body =
-    await request.json().catch(
-      () => ({})
+  const user =
+    await ensureUser(db, tgUser);
+
+  const today =
+    new Intl.DateTimeFormat(
+      "en-CA",
+      {
+        timeZone: "Europe/Moscow",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }
+    ).format(new Date());
+
+  const bonus =
+    await getNumberSetting(
+      db,
+      "daily_bonus",
+      0
     );
 
-  const target =
-    String(body.target_telegram_id || "")
-      .trim();
-
-  const targetRole =
-    String(body.target_role || "")
-      .trim();
-
-  const text =
-    String(body.complaint_text || "")
-      .trim();
-
-  if (!target || !targetRole || !text) {
+  if (bonus <= 0) {
     return json({
       ok: false,
-      error: "INVALID_COMPLAINT"
+      error: "BONUS_DISABLED",
+    });
+  }
+
+  const row =
+    await first(
+      db,
+      `
+        SELECT *
+        FROM daily_bonuses
+        WHERE telegram_id = ?
+      `,
+      user.telegram_id
+    );
+
+  if (
+    row &&
+    row.last_claim_date === today
+  ) {
+    return json({
+      ok: false,
+      error: "ALREADY_CLAIMED",
     }, 400);
   }
 
-  const result =
-    await env.DB
-      .prepare(`
-        INSERT INTO complaints (
-          reporter_telegram_id,
-          target_telegram_id,
-          target_role,
-          complaint_text
-        )
-        VALUES (?, ?, ?, ?)
-      `)
-      .bind(
-        user.telegram_id,
-        target,
-        targetRole,
-        text
+  const oldUC =
+    Number(user.uc || 0);
+
+  const newUC =
+    oldUC + bonus;
+
+  await db.batch([
+    db.prepare(`
+      UPDATE users
+      SET
+        uc = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE telegram_id = ?
+    `).bind(
+      newUC,
+      user.telegram_id
+    ),
+
+    db.prepare(`
+      INSERT INTO daily_bonuses
+      (
+        telegram_id,
+        last_claim_date
       )
-      .run();
+      VALUES (?, ?)
+      ON CONFLICT(telegram_id)
+      DO UPDATE SET
+        last_claim_date = excluded.last_claim_date,
+        updated_at = CURRENT_TIMESTAMP
+    `).bind(
+      user.telegram_id,
+      today
+    ),
+
+    db.prepare(`
+      INSERT INTO uc_audit
+      (
+        actor_telegram_id,
+        target_telegram_id,
+        old_uc,
+        new_uc,
+        amount,
+        reason
+      )
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(
+      user.telegram_id,
+      user.telegram_id,
+      oldUC,
+      newUC,
+      bonus,
+      "Ежедневный бонус"
+    )
+  ]);
 
   return json({
     ok: true,
-    complaint_id:
-      result.meta.last_row_id
+    bonus,
+    uc: newUC,
   });
 }
 
 
-// ======================================================
-// CHAT
-// ======================================================
+/* =========================================================
+   PROMO
+========================================================= */
 
-async function getChat(user, env) {
-  const result =
-    await env.DB
-      .prepare(`
+async function apiPromoUse(request, env) {
+  const tgUser = await getTelegramUser(
+    request,
+    env
+  );
+
+  const body =
+    await request.json();
+
+  const code =
+    String(body.code || "")
+      .trim()
+      .toUpperCase();
+
+  if (!code) {
+    return json({
+      ok: false,
+      error: "CODE_REQUIRED",
+    }, 400);
+  }
+
+  const db = env.DB;
+
+  const user =
+    await ensureUser(db, tgUser);
+
+  const promo =
+    await first(
+      db,
+      `
+        SELECT *
+        FROM promo_codes
+        WHERE code = ?
+          AND enabled = 1
+          AND (
+            expires_at IS NULL
+            OR expires_at > CURRENT_TIMESTAMP
+          )
+      `,
+      code
+    );
+
+  if (!promo) {
+    return json({
+      ok: false,
+      error: "PROMO_NOT_FOUND",
+    }, 404);
+  }
+
+  if (
+    promo.max_uses !== null &&
+    Number(promo.uses_count) >=
+      Number(promo.max_uses)
+  ) {
+    return json({
+      ok: false,
+      error: "PROMO_LIMIT",
+    }, 400);
+  }
+
+  const already =
+    await first(
+      db,
+      `
+        SELECT id
+        FROM promo_uses
+        WHERE promo_id = ?
+          AND telegram_id = ?
+      `,
+      promo.id,
+      user.telegram_id
+    );
+
+  if (already) {
+    return json({
+      ok: false,
+      error: "PROMO_ALREADY_USED",
+    }, 400);
+  }
+
+  await db.batch([
+    db.prepare(`
+      INSERT INTO promo_uses
+      (
+        promo_id,
+        telegram_id
+      )
+      VALUES (?, ?)
+    `).bind(
+      promo.id,
+      user.telegram_id
+    ),
+
+    db.prepare(`
+      UPDATE promo_codes
+      SET uses_count = uses_count + 1
+      WHERE id = ?
+    `).bind(promo.id),
+  ]);
+
+  return json({
+    ok: true,
+    message:
+      "Промокод активирован. Бесплатное вращение доступно."
+  });
+      }
+      /* =========================================================
+   ADMIN LOGIN
+========================================================= */
+
+async function apiAdminLogin(request, env) {
+  const tgUser =
+    await getTelegramUser(
+      request,
+      env
+    );
+
+  const body =
+    await request.json();
+
+  const login =
+    String(body.login || "").trim();
+
+  const password =
+    String(body.password || "");
+
+  const db = env.DB;
+
+  const user =
+    await ensureUser(db, tgUser);
+
+  if (!isAdmin(user)) {
+    return json({
+      ok: false,
+      error: "FORBIDDEN",
+    }, 403);
+  }
+
+  const access =
+    await first(
+      db,
+      `
+        SELECT *
+        FROM employee_access
+        WHERE telegram_id = ?
+      `,
+      user.telegram_id
+    );
+
+  if (
+    !access ||
+    !Number(access.login_enabled)
+  ) {
+    return json({
+      ok: false,
+      error: "LOGIN_DISABLED",
+    }, 403);
+  }
+
+  if (
+    user.admin_login !== login
+  ) {
+    return json({
+      ok: false,
+      error: "INVALID_LOGIN",
+    }, 401);
+  }
+
+  const valid =
+    await verifyPassword(
+      password,
+      user.admin_password_hash
+    );
+
+  if (!valid) {
+    return json({
+      ok: false,
+      error: "INVALID_PASSWORD",
+    }, 401);
+  }
+
+  await run(
+    db,
+    `
+      UPDATE users
+      SET
+        panel_session = 1,
+        panel_last_activity = CURRENT_TIMESTAMP,
+        last_login_at = CURRENT_TIMESTAMP,
+        panel_status = 'online'
+      WHERE telegram_id = ?
+    `,
+    user.telegram_id
+  );
+
+  /*
+   * Стартуем сессию активности.
+   */
+  await run(
+    db,
+    `
+      INSERT INTO staff_activity_sessions
+      (
+        telegram_id,
+        started_at,
+        active
+      )
+      VALUES (?, CURRENT_TIMESTAMP, 1)
+    `,
+    user.telegram_id
+  );
+
+  return json({
+    ok: true,
+    message: "Вход выполнен",
+    rank: numericRank(user),
+  });
+}
+
+
+/* =========================================================
+   ADMIN LOGOUT
+========================================================= */
+
+async function apiAdminLogout(request, env) {
+  const user =
+    await requirePanel(
+      request,
+      env,
+      1
+    );
+
+  const db = env.DB;
+
+  await run(
+    db,
+    `
+      UPDATE staff_activity_sessions
+      SET
+        ended_at = CURRENT_TIMESTAMP,
+        active = 0
+      WHERE telegram_id = ?
+        AND active = 1
+    `,
+    user.telegram_id
+  );
+
+  await run(
+    db,
+    `
+      UPDATE users
+      SET
+        panel_session = 0,
+        panel_status = 'offline',
+        panel_last_activity = CURRENT_TIMESTAMP
+      WHERE telegram_id = ?
+    `,
+    user.telegram_id
+  );
+
+  return json({
+    ok: true,
+  });
+}
+
+
+/* =========================================================
+   ADMIN DASHBOARD
+========================================================= */
+
+async function apiAdminDashboard(request, env) {
+  const user =
+    await requirePanel(
+      request,
+      env,
+      1
+    );
+
+  const db = env.DB;
+
+  const rank =
+    numericRank(user);
+
+  const online =
+    await first(
+      db,
+      `
+        SELECT COUNT(*) AS count
+        FROM users
+        WHERE
+          rank >= 1
+          AND panel_session = 1
+      `
+    );
+
+  const complaints =
+    await first(
+      db,
+      `
+        SELECT COUNT(*) AS count
+        FROM complaints
+        WHERE status = 'pending'
+      `
+    );
+
+  const topups =
+    await first(
+      db,
+      `
+        SELECT COUNT(*) AS count
+        FROM topup_requests
+        WHERE status = 'pending'
+      `
+    );
+
+  const withdrawals =
+    await first(
+      db,
+      `
+        SELECT COUNT(*) AS count
+        FROM payout_requests
+        WHERE status = 'pending'
+      `
+    );
+
+  const staff =
+    await all(
+      db,
+      `
         SELECT
-          id,
-          telegram_id,
-          username,
-          role_key,
-          message,
-          created_at
-        FROM wheel_chat_messages
-        WHERE deleted = 0
-        ORDER BY id DESC
-        LIMIT 100
-      `)
-      .all();
-
-  return json({
-    ok: true,
-    messages:
-      (result.results || []).reverse()
-  });
-}
-
-
-async function sendChatMessage(
-  request,
-  user,
-  env
-) {
-  const body =
-    await request.json().catch(
-      () => ({})
+          u.telegram_id,
+          u.username,
+          u.first_name,
+          u.rank,
+          u.panel_status,
+          u.panel_session,
+          u.panel_last_activity,
+          COALESCE(sp.points, 0) AS points
+        FROM users u
+        LEFT JOIN staff_points sp
+          ON sp.telegram_id = u.telegram_id
+        WHERE u.rank >= 1
+        ORDER BY u.rank DESC, points DESC
+      `
     );
 
-  const message =
-    String(body.message || "")
-      .trim();
-
-  if (!message) {
-    return json({
-      ok: false,
-      error: "EMPTY_MESSAGE"
-    }, 400);
-  }
-
-  if (message.length > 500) {
-    return json({
-      ok: false,
-      error: "MESSAGE_TOO_LONG"
-    }, 400);
-     }
-     const result =
-    await env.DB
-      .prepare(`
-        INSERT INTO wheel_chat_messages (
-          telegram_id,
-          username,
-          role_key,
-          message
-        )
-        VALUES (?, ?, ?, ?)
-      `)
-      .bind(
-        user.telegram_id,
-        user.username || null,
-        getRoleKey(user),
-        message
-      )
-      .run();
-
   return json({
     ok: true,
-    id: result.meta.last_row_id
+
+    current_user: {
+      telegram_id: user.telegram_id,
+      rank,
+    },
+
+    stats: {
+      online_admins:
+        Number(online?.count || 0),
+
+      pending_complaints:
+        Number(complaints?.count || 0),
+
+      pending_topups:
+        Number(topups?.count || 0),
+
+      pending_withdrawals:
+        Number(withdrawals?.count || 0),
+    },
+
+    staff,
   });
-}
+    }
+/* =========================================================
+   ADMIN USERS SEARCH
+========================================================= */
 
+async function apiAdminUsers(request, env) {
+  const user =
+    await requirePanel(
+      request,
+      env,
+      4
+    );
 
-function getRoleKey(user) {
+  const db = env.DB;
 
-  if (Number(user.rank) >= 1) {
-    return `rank_${user.rank}`;
-  }
-
-  if (user.role === MODERATOR_ROLE) {
-    return MODERATOR_ROLE;
-  }
-
-  return "player";
-}
-
-
-// ======================================================
-// ADMIN ROUTER
-// ======================================================
-
-async function adminRouter(
-  request,
-  user,
-  env
-) {
   const url =
     new URL(request.url);
 
-  // ----------------------------------------------------
-  // Admin dashboard
-  // ----------------------------------------------------
+  const q =
+    String(
+      url.searchParams.get("q") || ""
+    ).trim();
 
-  if (
-    request.method === "GET" &&
-    url.pathname === "/api/admin/dashboard"
-  ) {
-    return await adminDashboard(
-      user,
-      env
+  if (!q) {
+    return json({
+      ok: true,
+      users: [],
+    });
+  }
+
+  const users =
+    await all(
+      db,
+      `
+        SELECT
+          telegram_id,
+          username,
+          first_name,
+          last_name,
+          role,
+          rank,
+          balance,
+          uc,
+          created_at,
+          updated_at,
+          panel_status,
+          panel_session,
+          panel_last_activity
+        FROM users
+        WHERE
+          telegram_id LIKE ?
+          OR username LIKE ?
+          OR admin_login LIKE ?
+        ORDER BY rank DESC, telegram_id ASC
+        LIMIT 100
+      `,
+      `%${q}%`,
+      `%${q}%`,
+      `%${q}%`
     );
-  }
-
-  // ----------------------------------------------------
-  // Search player
-  // ----------------------------------------------------
-
-  if (
-    request.method === "GET" &&
-    url.pathname === "/api/admin/player"
-  ) {
-
-    if (
-      Number(user.rank) < 4
-    ) {
-      return json({
-        ok: false,
-        error: "FORBIDDEN"
-      }, 403);
-    }
-
-    const id =
-      url.searchParams.get(
-        "telegram_id"
-      );
-
-    if (!id) {
-      return json({
-        ok: false,
-        error: "ID_REQUIRED"
-      }, 400);
-    }
-
-    return await adminPlayerSearch(
-      id,
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // Rank
-  // ----------------------------------------------------
-
-  if (
-    request.method === "POST" &&
-    url.pathname === "/api/admin/rank"
-  ) {
-    return await adminRank(
-      request,
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // Unrank
-  // ----------------------------------------------------
-
-  if (
-    request.method === "POST" &&
-    url.pathname === "/api/admin/unrank"
-  ) {
-    return await adminUnrank(
-      request,
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // Wheel settings
-  // ----------------------------------------------------
-
-  if (
-    request.method === "POST" &&
-    url.pathname === "/api/admin/wheel/settings"
-  ) {
-    return await updateWheelSettings(
-      request,
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // Wheel prizes
-  // ----------------------------------------------------
-
-  if (
-    request.method === "POST" &&
-    url.pathname === "/api/admin/wheel/prize"
-  ) {
-    return await updateWheelPrize(
-      request,
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // Maintenance
-  // ----------------------------------------------------
-
-  if (
-    request.method === "POST" &&
-    url.pathname === "/api/admin/maintenance"
-  ) {
-    return await updateMaintenance(
-      request,
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // Emergency
-  // ----------------------------------------------------
-
-  if (
-    request.method === "POST" &&
-    url.pathname === "/api/admin/emergency"
-  ) {
-    return await updateEmergency(
-      request,
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // Activity
-  // ----------------------------------------------------
-
-  if (
-    request.method === "GET" &&
-    url.pathname === "/api/admin/activity"
-  ) {
-    if (!isCurator(user)) {
-      return json({
-        ok: false,
-        error: "FORBIDDEN"
-      }, 403);
-    }
-
-    return await getStaffActivity(
-      user,
-      env
-    );
-  }
-
-  // ----------------------------------------------------
-  // Notifications
-  // ----------------------------------------------------
-
-  if (
-    request.method === "GET" &&
-    url.pathname === "/api/admin/notifications"
-  ) {
-    return await getNotifications(
-      user,
-      env
-    );
-  }
-
-  return json({
-    ok: false,
-    error: "ADMIN_ENDPOINT_NOT_FOUND"
-  }, 404);
-}
-
-
-// ======================================================
-// ADMIN DASHBOARD
-// ======================================================
-   async function adminDashboard(
-  user,
-  env
-) {
-  const counts = {};
-
-  const tables = [
-    ["complaints", "pending"],
-    ["topup_requests", "pending"],
-    ["payout_requests", "pending"],
-    ["support_tickets", "open"]
-  ];
-
-  for (
-    const [table, status]
-    of tables
-  ) {
-
-    const row =
-      await env.DB
-        .prepare(`
-          SELECT COUNT(*) AS count
-          FROM ${table}
-          WHERE status = ?
-        `)
-        .bind(status)
-        .first();
-
-    counts[table] =
-      Number(row?.count || 0);
-  }
 
   return json({
     ok: true,
-
-    admin: {
-      telegram_id: user.telegram_id,
-      username: user.username,
-      rank: user.rank,
-      role: user.role
-    },
-
-    counts
+    users,
   });
 }
 
 
-// ======================================================
-// PLAYER SEARCH
-// ======================================================
+/* =========================================================
+   ADMIN USER CARD
+========================================================= */
 
-async function adminPlayerSearch(
-  telegramId,
-  actor,
-  env
-) {
-  const target =
-    await getUser(
+async function apiAdminUser(request, env) {
+  const user =
+    await requirePanel(
+      request,
       env,
-      telegramId
+      4
+    );
+
+  const url =
+    new URL(request.url);
+
+  const targetId =
+    url.searchParams.get(
+      "telegram_id"
+    );
+
+  if (!targetId) {
+    return json({
+      ok: false,
+      error: "ID_REQUIRED",
+    }, 400);
+  }
+
+  const db = env.DB;
+
+  const target =
+    await first(
+      db,
+      `
+        SELECT
+          telegram_id,
+          username,
+          first_name,
+          last_name,
+          role,
+          rank,
+          balance,
+          uc,
+          created_at,
+          updated_at,
+          panel_status,
+          panel_session,
+          panel_last_activity,
+          last_login_at
+        FROM users
+        WHERE telegram_id = ?
+      `,
+      targetId
     );
 
   if (!target) {
     return json({
       ok: false,
-      error: "USER_NOT_FOUND"
+      error: "USER_NOT_FOUND",
     }, 404);
   }
 
   const bans =
-    await env.DB
-      .prepare(`
+    await all(
+      db,
+      `
         SELECT *
         FROM bans
         WHERE telegram_id = ?
-      `)
-      .bind(telegramId)
-      .all();
+        ORDER BY created_at DESC
+        LIMIT 100
+      `,
+      targetId
+    );
 
   const mutes =
-    await env.DB
-      .prepare(`
+    await all(
+      db,
+      `
         SELECT *
         FROM mutes
         WHERE telegram_id = ?
-        ORDER BY id DESC
-        LIMIT 50
-      `)
-      .bind(telegramId)
-      .all();
+        ORDER BY created_at DESC
+        LIMIT 100
+      `,
+      targetId
+    );
 
   const spins =
-    await env.DB
-      .prepare(`
+    await all(
+      db,
+      `
         SELECT *
         FROM spin_history
         WHERE telegram_id = ?
-        ORDER BY id DESC
+        ORDER BY created_at DESC
         LIMIT 100
-      `)
-      .bind(telegramId)
-      .all();
-
-  const actions =
-    await env.DB
-      .prepare(`
-        SELECT *
-        FROM admin_actions
-        WHERE target_telegram_id = ?
-        ORDER BY id DESC
-        LIMIT 100
-      `)
-      .bind(telegramId)
-      .all();
+      `,
+      targetId
+    );
 
   const complaints =
-    await env.DB
-      .prepare(`
+    await all(
+      db,
+      `
         SELECT *
         FROM complaints
-        WHERE target_telegram_id = ?
-        ORDER BY id DESC
+        WHERE reporter_telegram_id = ?
+           OR target_telegram_id = ?
+        ORDER BY created_at DESC
         LIMIT 100
-      `)
-      .bind(telegramId)
-      .all();
+      `,
+      targetId,
+      targetId
+    );
 
   return json({
     ok: true,
-
-    user: {
-      telegram_id: target.telegram_id,
-      username: target.username,
-      first_name: target.first_name,
-      last_name: target.last_name,
-      role: target.role,
-      rank: target.rank,
-      balance: Number(target.balance),
-      uc: Number(target.uc),
-      created_at: target.created_at
-    },
-
-    bans: bans.results || [],
-    mutes: mutes.results || [],
-    spins: spins.results || [],
-    actions: actions.results || [],
-    complaints:
-      complaints.results || []
+    user: target,
+    bans,
+    mutes,
+    spins,
+    complaints,
   });
 }
 
 
-// ======================================================
-// RANK
-// ======================================================
+/* =========================================================
+   CHANGE RANK
+========================================================= */
 
-async function adminRank(
-  request,
-  actor,
-  env
-) {
-  if (
-    Number(actor.rank) < 5
-  ) {
-    return json({
-      ok: false,
-      error: "RANK_PERMISSION_DENIED"
-    }, 403);
-  }
-
-  const body =
-    await request.json().catch(
-      () => ({})
+async function apiAdminRank(request, env) {
+  const actor =
+    await requirePanel(
+      request,
+      env,
+      5
     );
 
+  const body =
+    await request.json();
+
   const targetId =
-    String(body.telegram_id || "")
-      .trim();
+    String(body.telegram_id || "");
 
   const newRank =
     Number(body.rank);
 
   const reason =
-    String(body.reason || "")
-      .trim();
+    String(body.reason || "");
 
-  if (
-    !targetId ||
-    !Number.isInteger(newRank) ||
-    newRank < 0 ||
-    newRank > 6
-  ) {
+  if (!targetId) {
     return json({
       ok: false,
-      error: "INVALID_RANK_REQUEST"
+      error: "ID_REQUIRED",
     }, 400);
   }
 
-  // Rank 5 cannot touch rank 6
-  if (
-    Number(actor.rank) === 5 &&
-    newRank >= 6
-  ) {
+  if (!Number.isInteger(newRank)) {
     return json({
       ok: false,
-      error: "RANK_6_RESERVED"
+      error: "INVALID_RANK",
+    }, 400);
+  }
+
+  if (!canRank(actor, newRank)) {
+    return json({
+      ok: false,
+      error: "RANK_FORBIDDEN",
     }, 403);
   }
 
+  const db = env.DB;
+
   const target =
-    await getUser(
-      env,
+    await first(
+      db,
+      `
+        SELECT *
+        FROM users
+        WHERE telegram_id = ?
+      `,
       targetId
     );
 
   if (!target) {
     return json({
       ok: false,
-      error: "USER_NOT_FOUND"
+      error: "USER_NOT_FOUND",
     }, 404);
   }
 
-  if (
-    Number(actor.rank) === 5 &&
-    Number(target.rank) >= 6
-  ) {
+  if (!canManageTarget(actor, target)) {
     return json({
       ok: false,
-      error: "CANNOT_MODIFY_RANK_6"
+      error: "TARGET_FORBIDDEN",
     }, 403);
   }
 
   const oldRank =
-    Number(target.rank);
+    numericRank(target);
 
-  await env.DB.batch([
-
-    env.DB.prepare(`
+  await db.batch([
+    db.prepare(`
       UPDATE users
       SET
         rank = ?,
         role = ?,
-        updated_at = ?
+        updated_at = CURRENT_TIMESTAMP
       WHERE telegram_id = ?
     `).bind(
       newRank,
-      roleForRank(newRank),
-      nowISO(),
+      newRank > 0 ? "admin" : "player",
       targetId
     ),
 
-    env.DB.prepare(`
-      INSERT INTO employee_promotions (
+    db.prepare(`
+      INSERT INTO employee_promotions
+      (
         telegram_id,
         old_rank,
         new_rank,
@@ -1952,48 +2111,18 @@ async function adminRank(
         decided_by,
         reason
       )
-      SELECT
-        ?,
-        ?,
-        ?,
-        COALESCE(
-          (
-            SELECT points
-            FROM staff_points
-            WHERE telegram_id = ?
-          ),
-          0
-        ),
-        ?,
-        ?
+      VALUES (?, ?, ?, 0, ?, ?)
     `).bind(
       targetId,
       oldRank,
       newRank,
-      targetId,
       actor.telegram_id,
-      reason || null
+      reason
     ),
 
-    env.DB.prepare(`
-      INSERT INTO admin_actions (
-        admin_telegram_id,
-        action,
-        target_telegram_id,
-        details
-      )
-      VALUES (?, 'rank_change', ?, ?)
-    `).bind(
-      actor.telegram_id,
-      targetId,
-      JSON.stringify({
-        oldRank,
-        newRank,
-        reason
-      })
-    ),
-     env.DB.prepare(`
-      INSERT INTO action_feed (
+    db.prepare(`
+      INSERT INTO action_feed
+      (
         actor_telegram_id,
         actor_name,
         actor_rank,
@@ -2004,1019 +2133,267 @@ async function adminRank(
       VALUES (?, ?, ?, 'rank_change', ?, ?)
     `).bind(
       actor.telegram_id,
-      actor.username ||
-        actor.first_name ||
-        null,
-      actor.rank,
+      actor.username || actor.first_name || "",
+      numericRank(actor),
       targetId,
-      JSON.stringify({
-        oldRank,
-        newRank
-      })
+      `Ранг ${oldRank} → ${newRank}`
     )
   ]);
 
   return json({
     ok: true,
     old_rank: oldRank,
-    new_rank: newRank
+    new_rank: newRank,
   });
 }
+/* =========================================================
+   BALANCE CONTROL
+========================================================= */
 
+async function apiAdminBalance(request, env) {
+  const actor =
+    await requirePanel(
+      request,
+      env,
+      5
+    );
 
-// ======================================================
-// UNRANK
-// ======================================================
+  const body =
+    await request.json();
 
-async function adminUnrank(
-  request,
-  actor,
-  env
-) {
+  const targetId =
+    String(body.telegram_id || "");
+
+  const amount =
+    Number(body.amount);
+
+  const reason =
+    String(body.reason || "");
+
   if (
-    Number(actor.rank) < 5
+    !targetId ||
+    !Number.isFinite(amount) ||
+    amount <= 0
   ) {
     return json({
       ok: false,
-      error: "FORBIDDEN"
-    }, 403);
-  }
-
-  const body =
-    await request.json().catch(
-      () => ({})
-    );
-
-  const targetId =
-    String(body.telegram_id || "")
-      .trim();
-
-  if (!targetId) {
-    return json({
-      ok: false,
-      error: "ID_REQUIRED"
+      error: "INVALID_DATA",
     }, 400);
   }
 
+  const db = env.DB;
+
   const target =
-    await getUser(
-      env,
+    await first(
+      db,
+      `
+        SELECT *
+        FROM users
+        WHERE telegram_id = ?
+      `,
       targetId
     );
 
   if (!target) {
     return json({
       ok: false,
-      error: "USER_NOT_FOUND"
+      error: "USER_NOT_FOUND",
     }, 404);
   }
 
-  if (
-    Number(actor.rank) === 5 &&
-    Number(target.rank) >= 6
-  ) {
-    return json({
-      ok: false,
-      error: "CANNOT_MODIFY_RANK_6"
-    }, 403);
-  }
+  const oldBalance =
+    Number(target.balance || 0);
 
-  const oldRank =
-    Number(target.rank);
+  const newBalance =
+    oldBalance + amount;
 
-  await env.DB.batch([
-
-    env.DB.prepare(`
+  await db.batch([
+    db.prepare(`
       UPDATE users
       SET
-        rank = 0,
-        role = 'player',
-        updated_at = ?
+        balance = ?,
+        updated_at = CURRENT_TIMESTAMP
       WHERE telegram_id = ?
     `).bind(
-      nowISO(),
+      newBalance,
       targetId
     ),
 
-    env.DB.prepare(`
-      INSERT INTO employee_promotions (
-        telegram_id,
-        old_rank,
-        new_rank,
-        points_at_decision,
-        decided_by,
-        reason
-      )
-      VALUES (?, ?, 0, 0, ?, 'unrank')
-    `).bind(
-      targetId,
-      oldRank,
-      actor.telegram_id
-    ),
-
-    env.DB.prepare(`
-      INSERT INTO admin_actions (
-        admin_telegram_id,
-        action,
+    db.prepare(`
+      INSERT INTO balance_audit
+      (
+        actor_telegram_id,
         target_telegram_id,
-        details
+        old_balance,
+        new_balance,
+        amount,
+        reason,
+        reference_type
       )
-      VALUES (?, 'unrank', ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, 'admin')
     `).bind(
       actor.telegram_id,
       targetId,
-      JSON.stringify({
-        oldRank,
-        newRank: 0
-      })
+      oldBalance,
+      newBalance,
+      amount,
+      reason || "Ручное начисление"
+    ),
+
+    db.prepare(`
+      INSERT INTO transactions
+      (
+        telegram_id,
+        type,
+        amount,
+        description
+      )
+      VALUES (?, 'admin_balance', ?, ?)
+    `).bind(
+      targetId,
+      amount,
+      reason || "Начисление баланса"
+    ),
+
+    db.prepare(`
+      INSERT INTO notification_center
+      (
+        target_telegram_id,
+        type,
+        title,
+        message
+      )
+      VALUES (?, 'balance', 'Пополнение баланса', ?)
+    `).bind(
+      targetId,
+      `Вам начислили ${amount} ₽. ${reason || ""}`
     )
   ]);
 
   return json({
     ok: true,
-    old_rank: oldRank,
-    new_rank: 0
+    old_balance: oldBalance,
+    new_balance: newBalance,
   });
 }
 
 
-function roleForRank(rank) {
+/* =========================================================
+   UC CONTROL
+========================================================= */
 
-  if (rank >= 1) {
-    return "admin";
-  }
-
-  return "player";
-}
-
-
-// ======================================================
-// WHEEL SETTINGS ADMIN
-// ======================================================
-
-async function updateWheelSettings(
-  request,
-  actor,
-  env
-) {
-  if (!isSenior(actor)) {
-    return json({
-      ok: false,
-      error: "FORBIDDEN"
-    }, 403);
-  }
-
-  const body =
-    await request.json().catch(
-      () => ({})
+async function apiAdminUC(request, env) {
+  const actor =
+    await requirePanel(
+      request,
+      env,
+      5
     );
 
-  const cost =
-    Number(body.spin_cost);
+  const body =
+    await request.json();
 
-  const enabled =
-    Number(body.enabled ? 1 : 0);
+  const targetId =
+    String(body.telegram_id || "");
+
+  const amount =
+    Number(body.amount);
+
+  const reason =
+    String(body.reason || "");
 
   if (
-    !Number.isFinite(cost) ||
-    cost < 0
+    !targetId ||
+    !Number.isInteger(amount)
   ) {
     return json({
       ok: false,
-      error: "INVALID_COST"
+      error: "INVALID_DATA",
     }, 400);
   }
 
-  await env.DB
-    .prepare(`
-      INSERT INTO wheel_settings (
-        id,
-        spin_cost,
-        currency,
-        enabled,
-        updated_by,
-        updated_at
-      )
-      VALUES (1, ?, 'RUB', ?, ?, ?)
-      ON CONFLICT(id)
-      DO UPDATE SET
-        spin_cost = excluded.spin_cost,
-        enabled = excluded.enabled,
-        updated_by = excluded.updated_by,
-        updated_at = excluded.updated_at
-    `)
-    .bind(
-      cost,
-      enabled,
-      actor.telegram_id,
-      nowISO()
-    )
-    .run();
+  const db = env.DB;
 
-  await writeAdminAction(
-    env,
-    actor,
-    "wheel_settings_update",
-    null,
-    {
-      spin_cost: cost,
-      enabled
-    }
-  );
-
-  return json({
-    ok: true
-  });
-}
-// ======================================================
-// WHEEL PRIZE ADMIN
-// ======================================================
-
-async function updateWheelPrize(
-  request,
-  actor,
-  env
-) {
-  if (!isSenior(actor)) {
-    return json({
-      ok: false,
-      error: "FORBIDDEN"
-    }, 403);
-  }
-
-  const body =
-    await request.json().catch(
-      () => ({})
-    );
-
-  const id =
-    Number(body.id);
-
-  if (!Number.isInteger(id)) {
-    return json({
-      ok: false,
-      error: "INVALID_ID"
-    }, 400);
-  }
-
-  const probability =
-    Number(body.probability);
-
-  const enabled =
-    Number(body.enabled ? 1 : 0);
-
-  if (
-    !Number.isFinite(probability) ||
-    probability < 0 ||
-    probability > 100
-  ) {
-    return json({
-      ok: false,
-      error: "INVALID_PROBABILITY"
-    }, 400);
-  }
-
-  await env.DB
-    .prepare(`
-      UPDATE wheel_prizes
-      SET
-        probability = ?,
-        enabled = ?,
-        updated_at = ?
-      WHERE id = ?
-    `)
-    .bind(
-      probability,
-      enabled,
-      nowISO(),
-      id
-    )
-    .run();
-
-  await writeAdminAction(
-    env,
-    actor,
-    "wheel_prize_update",
-    null,
-    {
-      prize_id: id,
-      probability,
-      enabled
-    }
-  );
-
-  return json({
-    ok: true
-  });
-}
-
-
-// ======================================================
-// MAINTENANCE
-// ======================================================
-
-async function updateMaintenance(
-  request,
-  actor,
-  env
-) {
-  if (!isSenior(actor)) {
-    return json({
-      ok: false,
-      error: "FORBIDDEN"
-    }, 403);
-  }
-
-  const body =
-    await request.json().catch(
-      () => ({})
-    );
-
-  const enabled =
-    Number(body.enabled ? 1 : 0);
-
-  await env.DB
-    .prepare(`
-      INSERT INTO maintenance_settings (
-        id,
-        enabled,
-        message,
-        reason,
-        ends_at,
-        updated_by,
-        updated_at
-      )
-      VALUES (
-        1, ?, ?, ?, ?, ?, ?
-      )
-      ON CONFLICT(id)
-      DO UPDATE SET
-        enabled = excluded.enabled,
-        message = excluded.message,
-        reason = excluded.reason,
-        ends_at = excluded.ends_at,
-        updated_by = excluded.updated_by,
-        updated_at = excluded.updated_at
-    `)
-    .bind(
-      enabled,
-      body.message || null,
-      body.reason || null,
-      body.ends_at || null,
-      actor.telegram_id,
-      nowISO()
-    )
-    .run();
-
-  return json({
-    ok: true
-  });
-}
-
-
-// ======================================================
-// EMERGENCY
-// ======================================================
-
-async function updateEmergency(
-  request,
-  actor,
-  env
-) {
-  if (!isSenior(actor)) {
-    return json({
-      ok: false,
-      error: "FORBIDDEN"
-    }, 403);
-  }
-
-  const body =
-    await request.json().catch(
-      () => ({})
-    );
-
-  const allowed = [
-    "wheel_disabled",
-    "topup_disabled",
-    "withdraw_disabled",
-    "promo_disabled"
-  ];
-
-  const statements = [];
-
-  for (const key of allowed) {
-
-    if (!(key in body)) {
-      continue;
-    }
-
-    statements.push(
-      env.DB.prepare(`
-        INSERT INTO system_flags (
-          key,
-          value,
-          updated_by,
-          updated_at
-        )
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(key)
-        DO UPDATE SET
-          value = excluded.value,
-          updated_by = excluded.updated_by,
-          updated_at = excluded.updated_at
-      `).bind(
-        key,
-        body[key] ? "1" : "0",
-        actor.telegram_id,
-        nowISO()
-      )
-    );
-  }
-
-  if (statements.length) {
-    await env.DB.batch(statements);
-  }
-
-  return json({
-    ok: true
-  });
-}
-// ======================================================
-// STAFF ACTIVITY
-// ======================================================
-
-async function getStaffActivity(
-  actor,
-  env
-) {
-  const date =
-    todayMSK();
-
-  const result =
-    await env.DB
-      .prepare(`
-        SELECT
-          d.*,
-          u.username,
-          u.first_name,
-          u.last_name,
-          u.rank,
-          u.panel_status,
-          u.panel_last_activity
-        FROM staff_activity_daily d
-        JOIN users u
-          ON u.telegram_id = d.telegram_id
-        WHERE d.activity_date = ?
-        ORDER BY
-          d.points_earned DESC,
-          d.active_minutes DESC
-      `)
-      .bind(date)
-      .all();
-
-  return json({
-    ok: true,
-    date,
-    activity:
-      result.results || []
-  });
-}
-
-
-// ======================================================
-// NOTIFICATIONS
-// ======================================================
-
-async function getNotifications(
-  user,
-  env
-) {
-  const result =
-    await env.DB
-      .prepare(`
+  const target =
+    await first(
+      db,
+      `
         SELECT *
-        FROM notification_center
-        WHERE
-          target_telegram_id IS NULL
-          OR target_telegram_id = ?
-        ORDER BY id DESC
-        LIMIT 100
-      `)
-      .bind(user.telegram_id)
-      .all();
+        FROM users
+        WHERE telegram_id = ?
+      `,
+      targetId
+    );
 
-  return json({
-    ok: true,
-    notifications:
-      result.results || []
-  });
-}
+  if (!target) {
+    return json({
+      ok: false,
+      error: "USER_NOT_FOUND",
+    }, 404);
+  }
 
+  const oldUC =
+    Number(target.uc || 0);
 
-// ======================================================
-// ADMIN ACTION
-// ======================================================
+  const newUC =
+    Math.max(
+      0,
+      oldUC + amount
+    );
 
-async function writeAdminAction(
-  env,
-  actor,
-  action,
-  target,
-  details
-) {
-  await env.DB.batch([
+  const actualAmount =
+    newUC - oldUC;
 
-    env.DB.prepare(`
-      INSERT INTO admin_actions (
-        admin_telegram_id,
-        action,
-        target_telegram_id,
-        details
-      )
-      VALUES (?, ?, ?, ?)
+  await db.batch([
+    db.prepare(`
+      UPDATE users
+      SET
+        uc = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE telegram_id = ?
     `).bind(
-      actor.telegram_id,
-      action,
-      target || null,
-      JSON.stringify(details || {})
+      newUC,
+      targetId
     ),
 
-    env.DB.prepare(`
-      INSERT INTO action_feed (
+    db.prepare(`
+      INSERT INTO uc_audit
+      (
         actor_telegram_id,
-        actor_name,
-        actor_rank,
-        action,
         target_telegram_id,
-        details
+        old_uc,
+        new_uc,
+        amount,
+        reason
       )
       VALUES (?, ?, ?, ?, ?, ?)
     `).bind(
       actor.telegram_id,
-      actor.username ||
-        actor.first_name ||
-        null,
-      actor.rank,
-      action,
-      target || null,
-      JSON.stringify(details || {})
+      targetId,
+      oldUC,
+      newUC,
+      actualAmount,
+      reason || "Ручное изменение UC"
+    ),
+
+    db.prepare(`
+      INSERT INTO notification_center
+      (
+        target_telegram_id,
+        type,
+        title,
+        message
+      )
+      VALUES (?, 'uc', 'Изменение UC', ?)
+    `).bind(
+      targetId,
+      `Ваш баланс изменён на ${actualAmount} UC.`
     )
   ]);
-}
-
-
-// ======================================================
-// SYSTEM NUMBER
-// ======================================================
-
-async function getSystemNumber(
-  env,
-  key,
-  fallback
-) {
-  const row =
-    await env.DB
-      .prepare(`
-        SELECT value
-        FROM system_settings
-        WHERE key = ?
-      `)
-      .bind(key)
-      .first();
-
-  if (!row) {
-    return fallback;
-  }
-
-  const number =
-    Number(row.value);
-
-  return Number.isFinite(number)
-    ? number
-    : fallback;
-}
-
-
-// ======================================================
-// TELEGRAM BOT
-// ======================================================
-
-async function telegramWebhook(
-  request,
-  env
-) {
-  const update =
-    await request.json();
-
-  // ----------------------------------------------
-  // MESSAGE
-  // ----------------------------------------------
-
-  if (update.message) {
-
-    const message =
-      update.message;
-
-    const telegramUser =
-      message.from;
-
-    if (!telegramUser) {
-      return json({
-        ok: true
-      });
-    }
-
-    const user =
-      await ensureUser(
-        env,
-        telegramUser
-      );
-
-    const text =
-      String(message.text || "")
-        .trim();
-
-    // /start
-    if (
-      text === "/start" ||
-      text.startsWith("/start ")
-    ) {
-      await telegramStart(
-        message.chat.id,
-        user,
-        env
-      );
-
-      return json({
-        ok: true
-      });
-    }
-
-    // /alogin
-    if (text === "/alogin") {
-
-      if (
-        Number(user.rank) >= 1
-      ) {
-        await telegramSendMessage(
-          env,
-          message.chat.id,
-          "🔐 Админ-панель\n\nОткройте Mini App для входа в панель."
-        );
-}
-       return json({
-        ok: true
-      });
-    }
-
-    // /hlogin
-    if (text === "/hlogin") {
-
-      if (
-        user.role === MODERATOR_ROLE
-      ) {
-        await telegramSendMessage(
-          env,
-          message.chat.id,
-          "🔐 Панель модератора\n\nОткройте Mini App для входа."
-        );
-      }
-
-      return json({
-        ok: true
-      });
-    }
-
-    // /admins
-    if (text === "/admins") {
-      await telegramAdmins(
-        message.chat.id,
-        env
-      );
-
-      return json({
-        ok: true
-      });
-    }
-
-    // /moder
-    if (text === "/moder") {
-      await telegramModerators(
-        message.chat.id,
-        env
-      );
-
-      return json({
-        ok: true
-      });
-    }
-
-    // Unknown command
-    return json({
-      ok: true
-    });
-  }
 
   return json({
-    ok: true
+    ok: true,
+    old_uc: oldUC,
+    new_uc: newUC,
   });
-}
-
-
-// ======================================================
-// TELEGRAM START
-// ======================================================
-
-async function telegramStart(
-  chatId,
-  user,
-  env
-) {
-  const webApp =
-    env.WEBAPP_URL;
-
-  const keyboard = {
-    inline_keyboard: [
-      [
-        {
-          text: "🎰 Открыть DOXACHKAA UC",
-          web_app: {
-            url: webApp
-          }
-        }
-      ]
-    ]
-  };
-
-  await telegramSendMessage(
-    env,
-    chatId,
-    `🎰 <b>DOXACHKAA UC</b>\n\nДобро пожаловать!\n\nID: <code>${escapeHtml(user.telegram_id)}</code>`,
-    keyboard
-  );
-}
-
-
-// ======================================================
-// /admins
-// ======================================================
-
-async function telegramAdmins(
-  chatId,
-  env
-) {
-  const result =
-    await env.DB
-      .prepare(`
-        SELECT
-          telegram_id,
-          username,
-          first_name,
-          rank,
-          panel_status,
-          panel_session
-        FROM users
-        WHERE rank BETWEEN 1 AND 6
-          AND (
-            rank < 5
-            OR panel_session = 1
-          )
-        ORDER BY rank DESC
-      `)
-      .all();
-
-  const list =
-    result.results || [];
-
-  if (!list.length) {
-    await telegramSendMessage(
-      env,
-      chatId,
-      "👮 Сейчас администраторов онлайн нет."
-    );
-
-    return;
-  }
-
-  let text =
-    "👮 <b>Администраторы</b>\n\n";
-
-  for (const admin of list) {
-
-    const name =
-      admin.username
-        ? `@${escapeHtml(admin.username)}`
-        : escapeHtml(
-            admin.first_name ||
-            admin.telegram_id
-          );
-
-    text +=
-      `${statusIcon(admin.panel_status)} ` +
-      `${name} — ${admin.rank} ранг\n`;
-  }
-
-  await telegramSendMessage(
-    env,
-    chatId,
-    text
-  );
-}
-
-
-// ======================================================
-// /moder
-// ======================================================
-
-async function telegramModerators(
-  chatId,
-  env
-) {
-  const result =
-    await env.DB
-      .prepare(`
-        SELECT
-          telegram_id,
-          username,
-          first_name,
-          panel_status
-        FROM users
-        WHERE role = 'moderator'
-          AND panel_session = 1
-        ORDER BY first_name
-      `)
-      .all();
-
-  const list =
-    result.results || [];
-
-  if (!list.length) {
-
-    await telegramSendMessage(
-      env,
-      chatId,
-      "🟡 Модераторов онлайн нет."
-    );
-
-    return;
-  }
-
-  let text =
-    "🛡 <b>Модераторы</b>\n\n";
-
-  for (const moderator of list) {
-
-    const name =
-      moderator.username
-        ? `@${escapeHtml(moderator.username)}`
-        : escapeHtml(
-            moderator.first_name ||
-            moderator.telegram_id
-          );
-
-    text +=
-      `🟢 ${name}\n`;
-  }
-
-  await telegramSendMessage(
-    env,
-    chatId,
-    text
-  );
-}
-
-
-function statusIcon(status) {
-
-  switch (status) {
-
-    case "online":
-      return "🟢";
-
-    case "away":
-      return "🟡";
-
-    case "inactive":
-      return "🔴";
-
-    default:
-      return "⚫";
-  }
-}
-// ======================================================
-// TELEGRAM SEND
-// ======================================================
-
-async function telegramSendMessage(
-  env,
-  chatId,
-  text,
-  replyMarkup = null
-) {
-  if (!env.BOT_TOKEN) {
-    throw new Error(
-      "BOT_TOKEN is not configured"
-    );
-  }
-
-  const body = {
-    chat_id: chatId,
-    text,
-    parse_mode: "HTML"
-  };
-
-  if (replyMarkup) {
-    body.reply_markup =
-      replyMarkup;
-  }
-
-  const response =
-    await fetch(
-      `https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`,
-      {
-        method: "POST",
-
-        headers: {
-          "content-type":
-            "application/json"
-        },
-
-        body:
-          JSON.stringify(body)
-      }
-    );
-
-  if (!response.ok) {
-    console.error(
-      "Telegram API error",
-      await response.text()
-    );
-  }
-}
-
-
-// ======================================================
-// HTML
-// ======================================================
-
-async function serveIndex(env) {
-
-  /*
-   * Вариант 1:
-   * Если index.html лежит в Worker assets,
-   * здесь можно использовать env.ASSETS.
-   *
-   * Вариант 2:
-   * Cloudflare Pages / Worker Static Assets.
-   */
-
-  if (env.ASSETS) {
-
-    return await env.ASSETS.fetch(
-      new Request(
-        "https://internal/index.html"
-      )
-    );
-  }
-
-  return new Response(
-    `<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<title>DOXACHKAA UC</title>
-</head>
-<body style="
-background:#050b10;
-color:white;
-font-family:Arial;
-text-align:center;
-padding:50px;
-">
-<h1>DOXACHKAA UC</h1>
-<p>Mini App frontend не подключён.</p>
-</body>
-</html>`,
-    {
-      headers: {
-        "content-type":
-          "text/html; charset=utf-8"
-      }
-    }
-  );
-}
-
-
-// ======================================================
-// ESCAPE
-// ======================================================
-
-function escapeHtml(value) {
-
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
 }
