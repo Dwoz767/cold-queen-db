@@ -567,9 +567,8 @@ async function touchPanelSession(
      AND panel_session = 1`,
     String(telegramId)
   );
-}
-
-/* ============================================================
+  }
+     /* ============================================================
    AUDIT
    ============================================================ */
 
@@ -956,7 +955,6 @@ async function cmdALogin(
     env
   );
 }
-
 /* ============================================================
    MODERATOR LOGIN
    ============================================================ */
@@ -1337,8 +1335,7 @@ async function cmdPanel(
       env
     );
   }
-}
-
+       }
 /* ============================================================
    ADMIN PANEL
    ============================================================ */
@@ -2382,7 +2379,6 @@ async function searchUser(
     value
   );
 }
-
 /* ============================================================
    BAN USER
    ============================================================ */
@@ -2691,7 +2687,6 @@ async function getWheelPrizes(env) {
      ORDER BY sort_order ASC, id ASC`
   );
 }
-
 /* ============================================================
    UPDATE PRIZE
    ============================================================ */
@@ -3027,7 +3022,6 @@ async function showWheelAdmin(
     }
   );
 }
-
 /* ============================================================
    COMPLAINTS
    ============================================================ */
@@ -3329,160 +3323,10 @@ async function getAdminActionsToday(
   return Number(row?.count || 0);
 }
 
-async function getAdminActionHistory(
-  env,
-  telegramId,
-  limit = 20
-) {
-  return dbAll(
-    env,
-    `SELECT *
-     FROM admin_actions
-     WHERE admin_telegram_id = ?
-     ORDER BY id DESC
-     LIMIT ?`,
-    String(telegramId),
-    Number(limit)
-  );
-}
-
 /* ============================================================
    PANEL HOME
    ============================================================ */
 
-async function sendAdminPanel(
-  chatId,
-  employee,
-  env
-) {
-  const actions =
-    await getAdminActionsToday(
-      env,
-      employee.telegram_id
-    );
-
-  const wheel =
-    await getWheelSettings(env);
-
-  const maintenance =
-    await isMaintenanceEnabled(env);
-
-  const rank =
-    Number(employee.rank || 0);
-
-  const rankName =
-    rank === 6
-      ? "Главный Администратор"
-      : rank === 5
-        ? "Заместитель Главного Администратора"
-        : rank === 4
-          ? "Куратор"
-          : rank === 3
-            ? "Следящий администратор"
-            : rank === 2
-              ? "Администратор"
-              : rank === 1
-                ? "Администратор"
-                : "Сотрудник";
-
-  const buttons = [
-    [
-      {
-        text: "👤 ПОИСК ИГРОКА",
-        callback_data: "admin_search"
-      }
-    ],
-    [
-      {
-        text: "👮 АДМИНИСТРАТОРЫ",
-        callback_data: "admins_list"
-      },
-      {
-        text: "🛡 МОДЕРАТОРЫ",
-        callback_data: "moder_list"
-      }
-    ],
-    [
-      {
-        text: "🎡 КОЛЕСО",
-        callback_data: "wheel_admin"
-      }
-    ],
-    [
-      {
-        text: "📋 ЖАЛОБЫ",
-        callback_data: "moder_complaints"
-      }
-    ],
-    [
-      {
-        text: "📊 МОЯ АКТИВНОСТЬ",
-        callback_data: "my_activity"
-      }
-    ]
-  ];
-
-  if (rank >= 5) {
-    buttons.push([
-      {
-        text: maintenance
-          ? "🟢 ТЕХРАБОТЫ: ВЫКЛ"
-          : "🔴 ТЕХРАБОТЫ: ВКЛ",
-        callback_data:
-          maintenance
-            ? "maintenance_off"
-            : "maintenance_on"
-      }
-    ]);
-  }
-
-  buttons.push([
-    {
-      text: "🚪 ВЫЙТИ",
-      callback_data: "panel_logout"
-    }
-  ]);
-
-  await sendMessage(
-    chatId,
-    `<b>🛠 АДМИН-ПАНЕЛЬ</b>
-
-Сотрудник:
-<b>${escapeHtml(
-      employee.first_name ||
-      employee.username ||
-      employee.telegram_id
-    )}</b>
-
-Ранг:
-<b>${escapeHtml(
-      rankName
-    )}</b>
-
-Сегодня действий:
-<b>${actions}</b>
-
-Колесо:
-${
-  Number(wheel.enabled)
-    ? "🟢 включено"
-    : "🔴 выключено"
-}
-
-Техработы:
-${
-  maintenance
-    ? "🔴 включены"
-    : "🟢 выключены"
-}`,
-    env,
-    {
-      reply_markup: {
-        inline_keyboard: buttons
-      }
-    }
-  );
-}
 /* ============================================================
    DOXACHKAA UC — worker.js
    ЧАСТЬ 4/5
@@ -3997,9 +3841,9 @@ async function handleTextState(
     String(message.text || "").trim();
 
   if (!value) {
+   
     return true;
   }
-
   /* ==========================================================
      WHEEL PRICE
      ========================================================== */
@@ -4140,58 +3984,6 @@ async function handleTextState(
 /* ============================================================
    MODERATOR PANEL
    ============================================================ */
-
-async function sendModeratorPanel(
-  chatId,
-  employee,
-  env
-) {
-  const complaints =
-    await getPendingComplaints(env);
-
-  await sendMessage(
-    chatId,
-    `<b>🛡 ПАНЕЛЬ МОДЕРАТОРА</b>
-
-Сотрудник:
-<b>${escapeHtml(
-      employee.first_name ||
-      employee.username ||
-      employee.telegram_id
-    )}</b>
-
-Активных жалоб:
-<b>${complaints.length}</b>`,
-    env,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "📋 ЖАЛОБЫ",
-              callback_data:
-                "moder_complaints"
-            }
-          ],
-          [
-            {
-              text: "📊 МОЯ АКТИВНОСТЬ",
-              callback_data:
-                "my_activity"
-            }
-          ],
-          [
-            {
-              text: "🚪 ВЫЙТИ",
-              callback_data:
-                "panel_logout"
-            }
-          ]
-        ]
-      }
-    }
-  );
-}
 
 /* ============================================================
    SUPPORT TICKETS
@@ -4689,8 +4481,6 @@ async function usePromoCode(
       "❌ Система промокодов пока не подключена к текущей базе."
   };
 }
-
-
 /* ============================================================
    DAILY ACTION COUNT
    ============================================================ */
@@ -5058,117 +4848,6 @@ async function getActiveSilentBan(
    MAINTENANCE
    ============================================================ */
 
-async function isMaintenanceEnabled(
-  env
-) {
-  const row = await dbGet(
-    env,
-    `SELECT value
-     FROM system_settings
-     WHERE key = 'maintenance'
-     LIMIT 1`
-  );
-
-  return String(
-    row?.value || "0"
-  ) === "1";
-}
-
-
-async function setMaintenance(
-  env,
-  args,
-  employee,
-  chatId
-) {
-  if (
-    !employee ||
-    Number(employee.rank) < 5
-  ) {
-    await sendMessage(
-      chatId,
-      "❌ Недостаточно прав.",
-      env
-    );
-
-    return;
-  }
-
-  const mode =
-    String(args?.[0] || "")
-      .toLowerCase();
-
-  if (
-    mode !== "on" &&
-    mode !== "off"
-  ) {
-    await sendMessage(
-      chatId,
-      "❌ Использование: on или off.",
-      env
-    );
-
-    return;
-  }
-
-  const value =
-    mode === "on"
-      ? "1"
-      : "0";
-
-  await dbRun(
-    env,
-    `INSERT INTO system_settings
-     (
-       key,
-       value,
-       updated_by,
-       updated_at
-     )
-     VALUES (
-       'maintenance',
-       ?,
-       ?,
-       datetime('now')
-     )
-     ON CONFLICT(key)
-     DO UPDATE SET
-       value = excluded.value,
-       updated_by = excluded.updated_by,
-       updated_at = excluded.updated_at`,
-    value,
-    String(employee.telegram_id)
-  );
-
-  await dbRun(
-    env,
-    `INSERT INTO admin_actions
-     (
-       admin_telegram_id,
-       action,
-       details,
-       created_at
-     )
-     VALUES (?, ?, ?, datetime('now'))`,
-    String(employee.telegram_id),
-    mode === "on"
-      ? "maintenance_on"
-      : "maintenance_off",
-    mode === "on"
-      ? "Технический режим включён"
-      : "Технический режим выключен"
-  );
-
-  await sendMessage(
-    chatId,
-    mode === "on"
-      ? "🚧 Технический режим <b>ВКЛЮЧЕН</b>."
-      : "✅ Технический режим <b>ВЫКЛЮЧЕН</b>.",
-    env
-  );
-}
-
-
 /* ============================================================
    MOSCOW DATE
    ============================================================ */
@@ -5280,3 +4959,4 @@ function safeInteger(value, fallback = 0) {
 console.log(
   "DOXACHKAA UC Worker loaded successfully."
 );
+       
